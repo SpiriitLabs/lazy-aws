@@ -1,0 +1,30 @@
+[package]
+name = "lazy-aws"
+version = "0.1.0"
+edition = "2021"
+description = "A TUI for interacting with AWS services, inspired by lazygit"
+license = "MIT"
+readme = "README.md"
+keywords = ["aws", "ecs", "ssm", "tui", "terminal"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+log = "0.4"
+dirs = "6"
+which = "7"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+fuzzy-matcher = "0.3"
+ansi-to-tui = "7"
+chrono = "0.4"
+portable-pty = "0.8"
+vt100 = "0.15"
+
+[dev-dependencies]
+tempfile = "3"
+serial_test = "3"
