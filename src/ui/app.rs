@@ -28,6 +28,7 @@ const TAB_TASKS: usize = 1;
 const TAB_SSM: usize = 2;
 const TAB_LOGS: usize = 3;
 const TAB_RDS: usize = 4;
+const TAB_S3: usize = 5;
 
 /// Messages from background threads.
 enum BgMsg {
@@ -82,6 +83,16 @@ enum BgMsg {
     SsmTunnelError(String),
     SsmInstancesForTunnel(Vec<aws::Instance>),
     SsmInstancesForTunnelError(String),
+    BucketsLoaded(Vec<aws::Bucket>),
+    BucketsError(String),
+    ObjectsLoaded {
+        result: aws::S3ListResult,
+        bucket: String,
+        prefix: String,
+    },
+    ObjectsError(String),
+    DeleteObjectDone,
+    DeleteObjectError(String),
 }
 
 #[derive(PartialEq)]
@@ -112,6 +123,7 @@ enum InputMode {
     SqlQuery,
     ExportQueryResults,
     ImportSql,
+    S3Upload,
 }
 
 struct RdsConnection {
@@ -180,6 +192,10 @@ enum PendingAction {
         password: String,
         database: Option<String>,
     },
+    DeleteS3Object {
+        bucket: String,
+        key: String,
+    },
 }
 
 pub struct App {
@@ -202,6 +218,8 @@ pub struct App {
     rds_instances: panels::RdsInstancesPanel,
     rds_tables: panels::RdsTablesPanel,
     query_results: panels::QueryResultsPanel,
+    buckets: panels::BucketsPanel,
+    objects: panels::ObjectsPanel,
 
     // Components
     _status_bar: StatusBar,
@@ -235,6 +253,7 @@ pub struct App {
     caller_identity: Option<aws::CallerIdentity>,
     selected_cluster: Option<String>,
     selected_service: Option<String>,
+    selected_bucket: Option<String>,
 
     // Loading flags
     loading_clusters: bool,
@@ -246,11 +265,14 @@ pub struct App {
     loading_rds_instances: bool,
     loading_query: bool,
     loading_rds_tables: bool,
+    loading_buckets: bool,
+    loading_objects: bool,
 
     // Tab visit flags (for lazy loading)
     ssm_visited: bool,
     logs_visited: bool,
     rds_visited: bool,
+    s3_visited: bool,
 
     // RDS connection
     rds_connection: Option<RdsConnection>,
@@ -327,6 +349,8 @@ impl App {
             rds_instances: panels::RdsInstancesPanel::new(),
             rds_tables: panels::RdsTablesPanel::new(),
             query_results: panels::QueryResultsPanel::new(),
+            buckets: panels::BucketsPanel::new(),
+            objects: panels::ObjectsPanel::new(),
             _status_bar: StatusBar::new(),
             confirm: ConfirmDialog::new(),
             choice: ChoiceDialog::new(),
@@ -352,6 +376,7 @@ impl App {
             caller_identity: None,
             selected_cluster: None,
             selected_service: None,
+            selected_bucket: None,
             loading_clusters: false,
             loading_services: false,
             loading_tasks: false,
@@ -361,9 +386,12 @@ impl App {
             loading_rds_instances: false,
             loading_query: false,
             loading_rds_tables: false,
+            loading_buckets: false,
+            loading_objects: false,
             ssm_visited: false,
             logs_visited: false,
             rds_visited: false,
+            s3_visited: false,
             rds_connection: None,
             sql_history: Vec::new(),
             last_sql_query: String::new(),
@@ -737,6 +765,44 @@ impl App {
                     log::info!("credentials expired, triggering SSO login");
                     self.pending_sso_login = true;
                 }
+                BgMsg::BucketsLoaded(buckets) => {
+                    self.loading_buckets = false;
+                    self.buckets.set_buckets(buckets);
+                    self.spinner.stop();
+                }
+                BgMsg::BucketsError(e) => {
+                    self.loading_buckets = false;
+                    self.handle_aws_error(&e);
+                    self.spinner.stop();
+                }
+                BgMsg::ObjectsLoaded {
+                    result,
+                    bucket,
+                    prefix,
+                } => {
+                    // Only apply if still relevant (user may have navigated away)
+                    if self.selected_bucket.as_deref() == Some(&bucket)
+                        && self.objects.current_prefix == prefix
+                    {
+                        self.loading_objects = false;
+                        self.objects.set_result(result);
+                        self.spinner.stop();
+                    }
+                }
+                BgMsg::ObjectsError(e) => {
+                    self.loading_objects = false;
+                    self.handle_aws_error(&e);
+                    self.spinner.stop();
+                }
+                BgMsg::DeleteObjectDone => {
+                    self.spinner.stop();
+                    self.set_info("Object deleted".to_string());
+                    self.spawn_load_objects();
+                }
+                BgMsg::DeleteObjectError(e) => {
+                    self.spinner.stop();
+                    self.set_error(format!("Delete failed: {e}"));
+                }
             }
         }
     }
@@ -922,6 +988,10 @@ impl App {
         }
         if km.tab_rds.matches(&key) {
             self.switch_tab(TAB_RDS);
+            return false;
+        }
+        if km.tab_s3.matches(&key) {
+            self.switch_tab(TAB_S3);
             return false;
         }
 
@@ -1225,6 +1295,32 @@ impl App {
                     return false;
                 }
             }
+            TAB_S3 => {
+                // d = download
+                if km.download.matches(&key) {
+                    self.handle_s3_download();
+                    return false;
+                }
+                // u = upload
+                if km.upload.matches(&key) {
+                    self.handle_s3_upload_prompt();
+                    return false;
+                }
+                // x = delete
+                if km.delete_object.matches(&key) {
+                    self.handle_s3_delete();
+                    return false;
+                }
+                // s = cycle sort
+                if km.sort.matches(&key) {
+                    if self.active_panel == 0 {
+                        self.buckets.cycle_sort();
+                    } else {
+                        self.objects.cycle_sort();
+                    }
+                    return false;
+                }
+            }
             _ => {}
         }
 
@@ -1263,6 +1359,12 @@ impl App {
                         self.input_mode = InputMode::None;
                         if !value.is_empty() {
                             self.export_logs_to_file(&value);
+                        }
+                    }
+                    InputMode::S3Upload => {
+                        self.input_mode = InputMode::None;
+                        if !value.is_empty() {
+                            self.execute_s3_upload(&value);
                         }
                     }
                     InputMode::CustomDateStart => {
@@ -1436,6 +1538,19 @@ impl App {
             PendingAction::SaveRdsCredentials { .. } => {
                 // Handled above before runner extraction
             }
+            PendingAction::DeleteS3Object { bucket, key } => {
+                log::info!("delete s3 object: s3://{bucket}/{key}");
+                self.spinner.start("Deleting...");
+                let tx = self.bg_tx.clone();
+                thread::spawn(move || match runner.delete_object(&bucket, &key) {
+                    Ok(()) => {
+                        let _ = tx.send(BgMsg::DeleteObjectDone);
+                    }
+                    Err(e) => {
+                        let _ = tx.send(BgMsg::DeleteObjectError(e));
+                    }
+                });
+            }
         }
     }
 
@@ -1521,6 +1636,10 @@ impl App {
                 self.rds_visited = true;
                 self.spawn_load_rds_instances();
             }
+            TAB_S3 if !self.s3_visited => {
+                self.s3_visited = true;
+                self.spawn_load_buckets();
+            }
             _ => {}
         }
     }
@@ -1546,6 +1665,12 @@ impl App {
             }
             TAB_RDS => {
                 self.spawn_load_rds_instances();
+            }
+            TAB_S3 => {
+                self.spawn_load_buckets();
+                if self.selected_bucket.is_some() {
+                    self.spawn_load_objects();
+                }
             }
             _ => {}
         }
@@ -1582,6 +1707,13 @@ impl App {
                 2 => self.query_results.move_up(),
                 _ => {}
             },
+            TAB_S3 => {
+                if self.active_panel == 0 {
+                    self.buckets.move_up();
+                } else {
+                    self.objects.move_up();
+                }
+            }
             _ => {}
         }
     }
@@ -1617,6 +1749,13 @@ impl App {
                 2 => self.query_results.move_down(),
                 _ => {}
             },
+            TAB_S3 => {
+                if self.active_panel == 0 {
+                    self.buckets.move_down();
+                } else {
+                    self.objects.move_down();
+                }
+            }
             _ => {}
         }
     }
@@ -1674,6 +1813,33 @@ impl App {
                     }
                 }
             }
+            TAB_S3 => {
+                if self.active_panel == 0 {
+                    // Select bucket → load objects
+                    if let Some(bucket) = self.buckets.selected() {
+                        let name = bucket.name.clone();
+                        self.selected_bucket = Some(name.clone());
+                        self.objects.bucket_name = name;
+                        self.objects.navigate_into("");
+                        self.active_panel = 1;
+                        self.spawn_load_objects();
+                    }
+                } else if let Some(item) = self.objects.selected().cloned() {
+                    match item {
+                        panels::S3ObjectItem::ParentDir => {
+                            self.objects.go_up();
+                            self.spawn_load_objects();
+                        }
+                        panels::S3ObjectItem::Prefix(p) => {
+                            self.objects.navigate_into(&p);
+                            self.spawn_load_objects();
+                        }
+                        panels::S3ObjectItem::Object(_) => {
+                            // No action on Enter for objects
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1695,6 +1861,14 @@ impl App {
             }
             TAB_LOGS if self.active_panel == 1 => {
                 self.active_panel = 0;
+            }
+            TAB_S3 if self.active_panel == 1 => {
+                if self.objects.current_prefix.is_empty() {
+                    self.active_panel = 0;
+                } else {
+                    self.objects.go_up();
+                    self.spawn_load_objects();
+                }
             }
             _ => {}
         }
@@ -1944,6 +2118,43 @@ impl App {
                     self.detail.render(right_area, f.buffer_mut(), false);
                 }
             }
+            TAB_S3 => {
+                self.buckets.render(
+                    top_panel_area,
+                    f.buffer_mut(),
+                    self.active_panel == 0,
+                    self.loading_buckets,
+                );
+                self.objects.render(
+                    bottom_panel_area,
+                    f.buffer_mut(),
+                    self.active_panel == 1,
+                    self.loading_objects,
+                );
+                // Update detail panel based on focus
+                if self.active_panel == 1 {
+                    match self.objects.selected() {
+                        Some(panels::S3ObjectItem::Object(obj)) => {
+                            let bucket = self.selected_bucket.as_deref().unwrap_or("?").to_string();
+                            self.detail.set_lines(format_object_detail(obj, &bucket));
+                        }
+                        Some(panels::S3ObjectItem::Prefix(p)) => {
+                            let bucket = self.selected_bucket.as_deref().unwrap_or("?").to_string();
+                            self.detail.set_lines(vec![
+                                format!("Prefix: {p}"),
+                                String::new(),
+                                format!("URI: s3://{bucket}/{p}"),
+                            ]);
+                        }
+                        _ => {
+                            self.detail.clear();
+                        }
+                    }
+                } else if let Some(bucket) = self.buckets.selected() {
+                    self.detail.set_lines(format_bucket_detail(bucket));
+                }
+                self.detail.render(right_area, f.buffer_mut(), false);
+            }
             _ => {}
         }
 
@@ -2104,6 +2315,13 @@ impl App {
                 2 => self.query_results.filter.clone(),
                 _ => String::new(),
             },
+            TAB_S3 => {
+                if self.active_panel == 0 {
+                    self.buckets.filter.clone()
+                } else {
+                    self.objects.filter.clone()
+                }
+            }
             _ => String::new(),
         }
     }
@@ -2140,6 +2358,13 @@ impl App {
                 2 => self.query_results.set_filter(filter),
                 _ => {}
             },
+            TAB_S3 => {
+                if self.active_panel == 0 {
+                    self.buckets.set_filter(filter);
+                } else {
+                    self.objects.set_filter(filter);
+                }
+            }
             _ => {}
         }
     }
@@ -2170,11 +2395,11 @@ impl App {
     }
 
     fn handle_aws_error(&mut self, error: &str) {
+        // Only treat actual token/session expiry as auth errors.
+        // AccessDenied and ForbiddenException are permission errors (e.g. S3-only
+        // role calling ECS), NOT expired credentials.
         let is_auth_error = error.contains("ExpiredToken")
-            || error.contains("UnauthorizedAccess")
             || error.contains("InvalidIdentityToken")
-            || error.contains("AccessDenied")
-            || error.contains("AuthFailure")
             || error.contains("The SSO session")
             || error.contains("Token has expired")
             || error.contains("UnrecognizedClientException");
@@ -2225,6 +2450,25 @@ impl App {
                         .map(|s| s.log_stream_name.clone())
                 } else {
                     self.log_groups.selected().map(|g| g.log_group_name.clone())
+                }
+            }
+            TAB_S3 => {
+                if self.active_panel == 0 {
+                    self.buckets
+                        .selected()
+                        .map(|b| format!("arn:aws:s3:::{}", b.name))
+                } else {
+                    match self.objects.selected() {
+                        Some(panels::S3ObjectItem::Object(obj)) => {
+                            let bucket = self.selected_bucket.as_deref().unwrap_or("?");
+                            Some(format!("s3://{}/{}", bucket, obj.key))
+                        }
+                        Some(panels::S3ObjectItem::Prefix(p)) => {
+                            let bucket = self.selected_bucket.as_deref().unwrap_or("?");
+                            Some(format!("s3://{}/{}", bucket, p))
+                        }
+                        _ => None,
+                    }
                 }
             }
             _ => None,
@@ -3675,6 +3919,168 @@ impl App {
         self.choice.show("Switch AWS Profile", choices);
     }
 
+    // --- S3 methods ---
+
+    fn spawn_load_buckets(&mut self) {
+        let runner = match &self.runner {
+            Some(r) => Arc::clone(r),
+            None => return,
+        };
+        if self.loading_buckets {
+            return;
+        }
+        self.loading_buckets = true;
+        self.spinner.start("Loading buckets...");
+
+        let tx = self.bg_tx.clone();
+        thread::spawn(move || match runner.list_buckets() {
+            Ok(buckets) => {
+                let _ = tx.send(BgMsg::BucketsLoaded(buckets));
+            }
+            Err(e) => {
+                let _ = tx.send(BgMsg::BucketsError(e));
+            }
+        });
+    }
+
+    fn spawn_load_objects(&mut self) {
+        let bucket = match &self.selected_bucket {
+            Some(b) => b.clone(),
+            None => return,
+        };
+        if self.loading_objects {
+            return;
+        }
+        let runner = match &self.runner {
+            Some(r) => Arc::clone(r),
+            None => return,
+        };
+        let prefix = self.objects.current_prefix.clone();
+        self.loading_objects = true;
+        self.spinner.start("Loading objects...");
+        let tx = self.bg_tx.clone();
+        thread::spawn(move || match runner.list_objects(&bucket, &prefix) {
+            Ok(result) => {
+                let _ = tx.send(BgMsg::ObjectsLoaded {
+                    result,
+                    bucket,
+                    prefix,
+                });
+            }
+            Err(e) => {
+                let _ = tx.send(BgMsg::ObjectsError(e));
+            }
+        });
+    }
+
+    fn handle_s3_download(&mut self) {
+        let bucket = match &self.selected_bucket {
+            Some(b) => b.clone(),
+            None => {
+                self.set_error("No bucket selected".to_string());
+                return;
+            }
+        };
+        let obj = match self.objects.selected() {
+            Some(panels::S3ObjectItem::Object(o)) => o.clone(),
+            _ => {
+                self.set_error("Select an object to download".to_string());
+                return;
+            }
+        };
+        let runner = match &self.runner {
+            Some(r) => Arc::clone(r),
+            None => return,
+        };
+        let filename = obj.key.rsplit('/').next().unwrap_or(&obj.key);
+        let home = std::env::var("HOME").unwrap_or_default();
+        let dest = format!("{home}/Downloads/{filename}");
+
+        log::info!("downloading s3://{bucket}/{} to {dest}", obj.key);
+        self.output.clear();
+        self.output
+            .append_line(&format!("Downloading {} → {dest}", obj.key));
+
+        match runner.download_object(&bucket, &obj.key, &dest) {
+            Ok(handle) => {
+                self.stream_rx = Some(handle.rx);
+                self.child_pid = handle.child_pid;
+                self.spinner.start(&format!("Downloading {filename}..."));
+            }
+            Err(e) => {
+                self.set_error(format!("Download failed: {e}"));
+            }
+        }
+    }
+
+    fn handle_s3_upload_prompt(&mut self) {
+        if self.selected_bucket.is_none() {
+            self.set_error("No bucket selected".to_string());
+            return;
+        }
+        self.input_mode = InputMode::S3Upload;
+        let cwd = std::env::current_dir()
+            .map(|p| format!("{}/", p.display()))
+            .unwrap_or_default();
+        let bucket = self.selected_bucket.as_deref().unwrap_or("?");
+        let prefix = &self.objects.current_prefix;
+        self.input.show_with_value(
+            &format!("Upload to s3://{bucket}/{prefix}"),
+            "local file path...",
+            &cwd,
+        );
+    }
+
+    fn execute_s3_upload(&mut self, local_path: &str) {
+        let bucket = match &self.selected_bucket {
+            Some(b) => b.clone(),
+            None => return,
+        };
+        let runner = match &self.runner {
+            Some(r) => Arc::clone(r),
+            None => return,
+        };
+        let filename = local_path.rsplit('/').next().unwrap_or(local_path);
+        let key = format!("{}{}", self.objects.current_prefix, filename);
+
+        log::info!("uploading {local_path} to s3://{bucket}/{key}");
+        self.output.clear();
+        self.output
+            .append_line(&format!("Uploading {local_path} → s3://{bucket}/{key}"));
+
+        match runner.upload_object(local_path, &bucket, &key) {
+            Ok(handle) => {
+                self.stream_rx = Some(handle.rx);
+                self.child_pid = handle.child_pid;
+                self.spinner.start(&format!("Uploading {filename}..."));
+            }
+            Err(e) => {
+                self.set_error(format!("Upload failed: {e}"));
+            }
+        }
+    }
+
+    fn handle_s3_delete(&mut self) {
+        let bucket = match &self.selected_bucket {
+            Some(b) => b.clone(),
+            None => {
+                self.set_error("No bucket selected".to_string());
+                return;
+            }
+        };
+        match self.objects.selected() {
+            Some(panels::S3ObjectItem::Object(obj)) => {
+                let key = obj.key.clone();
+                self.confirm.show(&format!("Delete s3://{bucket}/{key}?"));
+                self.pending_action = Some(PendingAction::DeleteS3Object { bucket, key });
+            }
+            Some(panels::S3ObjectItem::Prefix(_)) => {
+                self.set_error("Cannot delete prefixes".to_string());
+            }
+            _ => {}
+        }
+    }
+
     fn switch_profile(&mut self, profile: &str) {
         log::info!("switching to profile: {profile}");
         self.active_profile = Some(profile.to_string());
@@ -3706,9 +4112,13 @@ impl App {
         self.caller_identity = None;
         self.selected_cluster = None;
         self.selected_service = None;
+        self.selected_bucket = None;
         self.ssm_visited = false;
         self.logs_visited = false;
         self.rds_visited = false;
+        self.s3_visited = false;
+        self.buckets.set_buckets(vec![]);
+        self.objects.clear();
         self.err = None;
 
         if is_sso_profile(profile) {
@@ -3731,13 +4141,32 @@ impl App {
         let tx = self.bg_tx.clone();
         thread::spawn(move || match runner.get_caller_identity() {
             Ok(identity) => {
-                // Credentials valid, send identity and signal to load data
                 let _ = tx.send(BgMsg::CallerIdentityLoaded(identity));
                 let _ = tx.send(BgMsg::CredentialsValid);
             }
-            Err(_) => {
-                // Credentials expired, need SSO login
-                let _ = tx.send(BgMsg::CredentialsExpired);
+            Err(e) => {
+                // "ForbiddenException" on GetRoleCredentials means the SSO token
+                // is valid but the role lacks STS access (e.g. S3-only roles).
+                // Only trigger re-login for actual token expiry errors.
+                let is_token_expired = e.contains("ExpiredToken")
+                    || e.contains("The SSO session")
+                    || e.contains("Token has expired")
+                    || e.contains("InvalidIdentityToken")
+                    || e.contains("UnrecognizedClientException")
+                    || e.contains("expired");
+
+                if is_token_expired {
+                    log::info!("credentials expired, triggering SSO login");
+                    let _ = tx.send(BgMsg::CredentialsExpired);
+                } else {
+                    // Permission error (ForbiddenException, AccessDenied, etc.)
+                    // Credentials are likely valid, proceed to load data.
+                    log::info!(
+                        "STS check failed with permission error, proceeding: {}",
+                        e.lines().next().unwrap_or(&e)
+                    );
+                    let _ = tx.send(BgMsg::CredentialsValid);
+                }
             }
         });
     }
@@ -3848,6 +4277,29 @@ fn resolve_profile_region(profile: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn format_bucket_detail(bucket: &aws::Bucket) -> Vec<String> {
+    vec![
+        format!("Bucket        {}", bucket.name),
+        format!("Created       {}", bucket.creation_date),
+        String::new(),
+        format!("ARN           arn:aws:s3:::{}", bucket.name),
+    ]
+}
+
+fn format_object_detail(obj: &aws::S3Object, bucket: &str) -> Vec<String> {
+    let size_str = crate::ui::panels::objects::format_size(obj.size);
+    vec![
+        format!("Key           {}", obj.key),
+        format!("Bucket        {bucket}"),
+        format!("Size          {} ({} bytes)", size_str, obj.size),
+        format!("Modified      {}", obj.last_modified),
+        format!("Storage       {}", obj.storage_class),
+        format!("ETag          {}", obj.e_tag),
+        String::new(),
+        format!("URI           s3://{bucket}/{}", obj.key),
+    ]
 }
 
 /// Checks if a profile uses SSO by looking for `sso_start_url` or `sso_session` in `~/.aws/config`.

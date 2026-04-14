@@ -199,3 +199,41 @@ pub struct DbSubnetGroup {
     pub vpc_id: String,
     pub subnet_group_status: String,
 }
+
+/// S3 Bucket.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct Bucket {
+    pub name: String,
+    pub creation_date: String,
+}
+
+/// S3 Object metadata.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct S3Object {
+    pub key: String,
+    pub size: i64,
+    pub last_modified: String,
+    pub storage_class: String,
+    #[serde(rename = "ETag")]
+    pub e_tag: String,
+}
+
+/// S3 CommonPrefix (simulated folder from delimiter-based listing).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct S3CommonPrefix {
+    pub prefix: String,
+}
+
+/// S3 list-objects-v2 response.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct S3ListResult {
+    pub contents: Vec<S3Object>,
+    pub common_prefixes: Vec<S3CommonPrefix>,
+    pub is_truncated: bool,
+    pub key_count: i64,
+    pub next_continuation_token: Option<String>,
+}

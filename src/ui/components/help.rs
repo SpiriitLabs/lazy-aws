@@ -316,6 +316,35 @@ fn help_sections() -> Vec<HelpSection> {
             ],
         },
         HelpSection {
+            title: "S3".to_string(),
+            bindings: vec![
+                Hint {
+                    key: "enter".to_string(),
+                    desc: "browse bucket / enter prefix".to_string(),
+                },
+                Hint {
+                    key: "backspace".to_string(),
+                    desc: "go up one prefix level".to_string(),
+                },
+                Hint {
+                    key: "d".to_string(),
+                    desc: "download object to ~/Downloads".to_string(),
+                },
+                Hint {
+                    key: "u".to_string(),
+                    desc: "upload local file to S3".to_string(),
+                },
+                Hint {
+                    key: "x".to_string(),
+                    desc: "delete object (with confirm)".to_string(),
+                },
+                Hint {
+                    key: "s".to_string(),
+                    desc: "cycle sort order (name/date/size)".to_string(),
+                },
+            ],
+        },
+        HelpSection {
             title: "General".to_string(),
             bindings: vec![
                 Hint {
@@ -418,11 +447,13 @@ mod tests {
         assert!(view.contains("ECS"));
         assert!(view.contains("SSM"));
         assert!(view.contains("Logs"));
+        assert!(view.contains("RDS"));
+        assert!(view.contains("S3"));
         assert!(view.contains("General"));
     }
 
     #[test]
     fn help_sections_count() {
-        assert_eq!(help_sections().len(), 8);
+        assert_eq!(help_sections().len(), 9);
     }
 }

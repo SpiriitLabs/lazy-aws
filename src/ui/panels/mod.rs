@@ -1,3 +1,4 @@
+pub mod buckets;
 pub mod clusters;
 pub mod containers;
 pub mod detail;
@@ -5,6 +6,7 @@ pub mod instances;
 pub mod log_groups;
 pub mod log_streams;
 pub mod log_viewer;
+pub mod objects;
 pub mod output;
 pub mod query_results;
 pub mod rds_instances;
@@ -13,6 +15,7 @@ pub mod services;
 pub mod tasks;
 pub mod terminal;
 
+pub use buckets::BucketsPanel;
 pub use clusters::ClustersPanel;
 pub use containers::ContainersPanel;
 pub use detail::DetailPanel;
@@ -20,6 +23,7 @@ pub use instances::InstancesPanel;
 pub use log_groups::LogGroupsPanel;
 pub use log_streams::LogStreamsPanel;
 pub use log_viewer::{render_log_detail, LogViewerPanel};
+pub use objects::{ObjectsPanel, S3ObjectItem};
 pub use output::OutputPanel;
 pub use query_results::QueryResultsPanel;
 pub use rds_instances::RdsInstancesPanel;

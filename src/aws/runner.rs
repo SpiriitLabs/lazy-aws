@@ -475,6 +475,109 @@ impl Runner {
         Ok(instances)
     }
 
+    pub fn list_buckets(&self) -> Result<Vec<Bucket>, String> {
+        let result = self.exec.run(&["s3api", "list-buckets"])?;
+        check_exit(&result)?;
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&result.stdout).map_err(|e| format!("parse error: {e}"))?;
+
+        let buckets: Vec<Bucket> = parsed["Buckets"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(buckets)
+    }
+
+    pub fn list_objects(&self, bucket: &str, prefix: &str) -> Result<S3ListResult, String> {
+        let mut all_contents = Vec::new();
+        let mut all_prefixes = Vec::new();
+        let mut continuation_token: Option<String> = None;
+
+        loop {
+            let mut args = vec![
+                "s3api",
+                "list-objects-v2",
+                "--bucket",
+                bucket,
+                "--delimiter",
+                "/",
+            ];
+            if !prefix.is_empty() {
+                args.push("--prefix");
+                args.push(prefix);
+            }
+            let token_owned;
+            if let Some(ref token) = continuation_token {
+                token_owned = token.clone();
+                args.push("--continuation-token");
+                args.push(&token_owned);
+            }
+
+            let result = self.exec.run(&args)?;
+            check_exit(&result)?;
+
+            if result.stdout.is_empty() {
+                break;
+            }
+
+            let parsed: S3ListResult =
+                serde_json::from_slice(&result.stdout).map_err(|e| format!("parse error: {e}"))?;
+
+            all_contents.extend(parsed.contents);
+            all_prefixes.extend(parsed.common_prefixes);
+
+            if !parsed.is_truncated {
+                break;
+            }
+            match parsed.next_continuation_token {
+                Some(token) => continuation_token = Some(token),
+                None => break,
+            }
+        }
+
+        Ok(S3ListResult {
+            contents: all_contents,
+            common_prefixes: all_prefixes,
+            is_truncated: false,
+            key_count: 0,
+            next_continuation_token: None,
+        })
+    }
+
+    pub fn delete_object(&self, bucket: &str, key: &str) -> Result<(), String> {
+        let result =
+            self.exec
+                .run(&["s3api", "delete-object", "--bucket", bucket, "--key", key])?;
+        check_exit(&result)?;
+        Ok(())
+    }
+
+    pub fn download_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        dest: &str,
+    ) -> Result<StreamHandle, String> {
+        let s3_uri = format!("s3://{bucket}/{key}");
+        self.exec.stream(&["s3", "cp", &s3_uri, dest])
+    }
+
+    pub fn upload_object(
+        &self,
+        local_path: &str,
+        bucket: &str,
+        key: &str,
+    ) -> Result<StreamHandle, String> {
+        let s3_uri = format!("s3://{bucket}/{key}");
+        self.exec.stream(&["s3", "cp", local_path, &s3_uri])
+    }
+
     /// Returns the aws CLI binary path and args needed to run `aws sso login --profile <profile>`.
     /// The caller is responsible for running this command interactively (suspend TUI).
     pub fn sso_login_command(&self, profile: &str) -> (String, Vec<String>) {
