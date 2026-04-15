@@ -23,6 +23,7 @@ pub struct KeyMap {
     pub tab_tasks: KeyBinding,
     pub tab_ssm: KeyBinding,
     pub tab_logs: KeyBinding,
+    pub tab_rds: KeyBinding,
     pub next_tab: KeyBinding,
     pub prev_tab: KeyBinding,
     pub up: KeyBinding,
@@ -91,6 +92,11 @@ pub fn default_key_map() -> KeyMap {
             keys: vec![key(KeyCode::Char('4'))],
             help_key: "4".to_string(),
             help_desc: "Logs".to_string(),
+        },
+        tab_rds: KeyBinding {
+            keys: vec![key(KeyCode::Char('5'))],
+            help_key: "5".to_string(),
+            help_desc: "RDS".to_string(),
         },
         next_tab: KeyBinding {
             keys: vec![key(KeyCode::Tab)],
@@ -220,6 +226,7 @@ mod tests {
             ("TabTasks", &km.tab_tasks),
             ("TabSsm", &km.tab_ssm),
             ("TabLogs", &km.tab_logs),
+            ("TabRds", &km.tab_rds),
             ("NextTab", &km.next_tab),
             ("PrevTab", &km.prev_tab),
             ("Up", &km.up),

@@ -15,6 +15,7 @@ use ratatui::Terminal;
 
 use crate::aws::exec::kill_process;
 use crate::aws::{self, Runner, StreamLine};
+use crate::credentials;
 use crate::ui::components::*;
 use crate::ui::keys::default_key_map;
 use crate::ui::layout::compute_layout;
@@ -26,6 +27,7 @@ const TAB_ECS: usize = 0;
 const TAB_TASKS: usize = 1;
 const TAB_SSM: usize = 2;
 const TAB_LOGS: usize = 3;
+const TAB_RDS: usize = 4;
 
 /// Messages from background threads.
 enum BgMsg {
@@ -61,6 +63,25 @@ enum BgMsg {
     InsightsError(String),
     CredentialsValid,
     CredentialsExpired,
+    DbInstancesLoaded(Vec<aws::DbInstance>),
+    DbInstancesError(String),
+    RdsConnectionOk,
+    RdsConnectionError(String),
+    RdsTablesLoaded(Vec<String>),
+    RdsTablesError(String),
+    QueryResult {
+        columns: Vec<String>,
+        rows: Vec<Vec<String>>,
+        duration_ms: u64,
+        query: String,
+    },
+    QueryError(String),
+    SsmTunnelReady {
+        pid: u32,
+    },
+    SsmTunnelError(String),
+    SsmInstancesForTunnel(Vec<aws::Instance>),
+    SsmInstancesForTunnelError(String),
 }
 
 #[derive(PartialEq)]
@@ -70,6 +91,9 @@ enum ChoiceMode {
     QueryTemplate,
     QueryHistory,
     ShellSelector,
+    RdsConnectMethod,
+    SqlHistory,
+    SsmInstanceSelector,
 }
 
 #[derive(PartialEq)]
@@ -82,6 +106,18 @@ enum InputMode {
     PanelFilter,
     KeywordSearch,
     ExportLogs,
+    RdsUsername,
+    RdsPassword,
+    RdsDatabase,
+    SqlQuery,
+}
+
+struct RdsConnection {
+    host: String,
+    port: i32,
+    user: String,
+    password: String,
+    database: Option<String>,
 }
 
 #[derive(Clone)]
@@ -126,9 +162,22 @@ impl TimeRange {
 }
 
 enum PendingAction {
-    ForceDeploy { cluster: String, service: String },
-    StopTask { cluster: String, task: String },
+    ForceDeploy {
+        cluster: String,
+        service: String,
+    },
+    StopTask {
+        cluster: String,
+        task: String,
+    },
     InstallSessionPlugin,
+    SaveRdsCredentials {
+        profile: String,
+        identifier: String,
+        username: String,
+        password: String,
+        database: Option<String>,
+    },
 }
 
 pub struct App {
@@ -148,6 +197,9 @@ pub struct App {
     output: panels::OutputPanel,
     detail: panels::DetailPanel,
     terminal: panels::TerminalPanel,
+    rds_instances: panels::RdsInstancesPanel,
+    rds_tables: panels::RdsTablesPanel,
+    query_results: panels::QueryResultsPanel,
 
     // Components
     _status_bar: StatusBar,
@@ -189,10 +241,27 @@ pub struct App {
     loading_instances: bool,
     loading_log_groups: bool,
     loading_log_streams: bool,
+    loading_rds_instances: bool,
+    loading_query: bool,
+    loading_rds_tables: bool,
 
     // Tab visit flags (for lazy loading)
     ssm_visited: bool,
     logs_visited: bool,
+    rds_visited: bool,
+
+    // RDS connection
+    rds_connection: Option<RdsConnection>,
+    sql_history: Vec<String>,
+    last_sql_query: String,
+    pending_rds_user: String,
+    pending_rds_password: String,
+    saved_credentials: credentials::SavedCredentials,
+    credentials_just_saved: bool, // avoid re-prompting after save
+    ssm_tunnel_pid: Option<u32>,
+    ssm_tunnel_local_port: Option<i32>,
+    pending_ssm_tunnel: bool,
+    tunnel_ssm_instances: Vec<aws::Instance>, // SSM instances available for tunneling
 
     // Session manager plugin
     session_plugin_installed: bool,
@@ -249,6 +318,9 @@ impl App {
             output: panels::OutputPanel::new(),
             detail: panels::DetailPanel::new(),
             terminal: panels::TerminalPanel::new(),
+            rds_instances: panels::RdsInstancesPanel::new(),
+            rds_tables: panels::RdsTablesPanel::new(),
+            query_results: panels::QueryResultsPanel::new(),
             _status_bar: StatusBar::new(),
             confirm: ConfirmDialog::new(),
             choice: ChoiceDialog::new(),
@@ -280,8 +352,23 @@ impl App {
             loading_instances: false,
             loading_log_groups: false,
             loading_log_streams: false,
+            loading_rds_instances: false,
+            loading_query: false,
+            loading_rds_tables: false,
             ssm_visited: false,
             logs_visited: false,
+            rds_visited: false,
+            rds_connection: None,
+            sql_history: Vec::new(),
+            last_sql_query: String::new(),
+            pending_rds_user: String::new(),
+            pending_rds_password: String::new(),
+            saved_credentials: credentials::load(),
+            credentials_just_saved: false,
+            ssm_tunnel_pid: None,
+            ssm_tunnel_local_port: None,
+            pending_ssm_tunnel: false,
+            tunnel_ssm_instances: vec![],
             session_plugin_installed: which::which("session-manager-plugin").is_ok(),
             pending_install_plugin: false,
             live_tail_active: false,
@@ -530,6 +617,101 @@ impl App {
                     self.set_error(format!("Insights: {e}"));
                     self.log_viewer.append_line(&format!("Error: {e}"));
                 }
+                BgMsg::DbInstancesLoaded(instances) => {
+                    self.loading_rds_instances = false;
+                    self.rds_instances.set_instances(instances);
+                    self.spinner.stop();
+                }
+                BgMsg::DbInstancesError(e) => {
+                    self.loading_rds_instances = false;
+                    self.handle_aws_error(&e);
+                    self.spinner.stop();
+                }
+                BgMsg::RdsConnectionOk => {
+                    self.spinner.stop();
+                    self.set_info("Connected".to_string());
+                    self.spawn_load_rds_tables();
+
+                    // Prompt to save credentials if not already saved
+                    if !self.credentials_just_saved {
+                        if let (Some(inst), Some(conn)) =
+                            (self.rds_instances.selected(), &self.rds_connection)
+                        {
+                            let profile =
+                                self.active_profile.clone().unwrap_or("default".to_string());
+                            let identifier = inst.db_instance_identifier.clone();
+                            self.pending_action = Some(PendingAction::SaveRdsCredentials {
+                                profile,
+                                identifier,
+                                username: conn.user.clone(),
+                                password: conn.password.clone(),
+                                database: conn.database.clone(),
+                            });
+                            self.confirm.show("Save credentials for this instance?");
+                        }
+                    }
+                }
+                BgMsg::RdsConnectionError(e) => {
+                    self.spinner.stop();
+                    self.rds_connection = None;
+                    self.set_error(format!("Connection failed: {e}"));
+                }
+                BgMsg::RdsTablesLoaded(tables) => {
+                    self.loading_rds_tables = false;
+                    self.rds_tables.set_tables(tables);
+                    self.spinner.stop();
+                }
+                BgMsg::RdsTablesError(e) => {
+                    self.loading_rds_tables = false;
+                    self.set_error(format!("Failed to load tables: {e}"));
+                    self.spinner.stop();
+                }
+                BgMsg::QueryResult {
+                    columns,
+                    rows,
+                    duration_ms,
+                    query,
+                } => {
+                    self.loading_query = false;
+                    self.query_results
+                        .set_results(columns, rows, query, duration_ms);
+                    self.spinner.stop();
+                    // Focus on right panel to see results
+                    self.active_panel = 2;
+                }
+                BgMsg::QueryError(e) => {
+                    self.loading_query = false;
+                    self.query_results.set_error(e);
+                    self.spinner.stop();
+                    self.active_panel = 2;
+                }
+                BgMsg::SsmTunnelReady { pid } => {
+                    self.spinner.stop();
+                    self.pending_ssm_tunnel = false;
+                    self.ssm_tunnel_pid = Some(pid);
+                    log::info!("SSM tunnel ready, pid={pid}");
+                    self.set_info(format!(
+                        "Tunnel open on port {}",
+                        self.ssm_tunnel_local_port.unwrap_or(0)
+                    ));
+                    // Now proceed with the username/password flow
+                    self.start_rds_connect_flow();
+                }
+                BgMsg::SsmTunnelError(e) => {
+                    self.spinner.stop();
+                    self.pending_ssm_tunnel = false;
+                    self.ssm_tunnel_local_port = None;
+                    self.set_error(format!("SSM tunnel: {e}"));
+                }
+                BgMsg::SsmInstancesForTunnel(instances) => {
+                    self.spinner.stop();
+                    self.tunnel_ssm_instances = instances;
+                    self.show_ssm_instance_selector();
+                }
+                BgMsg::SsmInstancesForTunnelError(e) => {
+                    self.spinner.stop();
+                    self.set_error(format!("Failed to load SSM instances: {e}"));
+                }
                 BgMsg::CredentialsValid => {
                     self.spinner.stop();
                     log::info!("credentials valid, loading data");
@@ -603,6 +785,25 @@ impl App {
                             };
                             self.pending_shell = Some(shell.to_string());
                             self.pending_exec = true;
+                        }
+                        ChoiceMode::RdsConnectMethod => match c {
+                            '1' => self.start_rds_connect_flow(),
+                            '2' => self.start_ssm_tunnel_flow(),
+                            _ => {}
+                        },
+                        ChoiceMode::SsmInstanceSelector => {
+                            let idx = (c as u8).wrapping_sub(b'1') as usize;
+                            if idx < self.tunnel_ssm_instances.len() {
+                                let target = self.tunnel_ssm_instances[idx].id.clone();
+                                self.open_ssm_tunnel(&target);
+                            }
+                        }
+                        ChoiceMode::SqlHistory => {
+                            let idx = (c as u8).wrapping_sub(b'1') as usize;
+                            if idx < self.sql_history.len() {
+                                self.last_sql_query = self.sql_history[idx].clone();
+                                self.show_sql_query_input();
+                            }
                         }
                     }
                 }
@@ -705,15 +906,25 @@ impl App {
             self.switch_tab(TAB_LOGS);
             return false;
         }
+        if km.tab_rds.matches(&key) {
+            self.switch_tab(TAB_RDS);
+            return false;
+        }
 
         // Panel switching within tab
         if km.next_tab.matches(&key) {
-            let max_panels = if self.active_tab == TAB_LOGS { 3 } else { 2 };
+            let max_panels = match self.active_tab {
+                TAB_LOGS | TAB_RDS => 3,
+                _ => 2,
+            };
             self.active_panel = (self.active_panel + 1) % max_panels;
             return false;
         }
         if km.prev_tab.matches(&key) {
-            let max_panels = if self.active_tab == TAB_LOGS { 3 } else { 2 };
+            let max_panels = match self.active_tab {
+                TAB_LOGS | TAB_RDS => 3,
+                _ => 2,
+            };
             self.active_panel = if self.active_panel == 0 {
                 max_panels - 1
             } else {
@@ -762,6 +973,21 @@ impl App {
                 }
                 KeyCode::PageDown => {
                     self.log_viewer.page_down();
+                    return false;
+                }
+                _ => {}
+            }
+        }
+
+        // Query results navigation (when focused on query results, panel 2 in RDS tab)
+        if self.active_tab == TAB_RDS && self.active_panel == 2 {
+            match key.code {
+                KeyCode::Char('h') | KeyCode::Left => {
+                    self.query_results.scroll_left();
+                    return false;
+                }
+                KeyCode::Char('l') | KeyCode::Right => {
+                    self.query_results.scroll_right();
                     return false;
                 }
                 _ => {}
@@ -942,6 +1168,38 @@ impl App {
                     return false;
                 }
             }
+            TAB_RDS => {
+                // c = connect
+                if key.code == KeyCode::Char('c') {
+                    self.handle_rds_connect();
+                    return false;
+                }
+                // d = disconnect
+                if key.code == KeyCode::Char('d') {
+                    if self.rds_connection.is_some() {
+                        self.rds_connection = None;
+                        self.rds_tables.set_tables(vec![]);
+                        self.query_results.clear();
+                        self.kill_ssm_tunnel();
+                        self.set_info("Disconnected".to_string());
+                    }
+                    return false;
+                }
+                // s = SQL query
+                if key.code == KeyCode::Char('s') {
+                    if self.rds_connection.is_some() {
+                        self.show_sql_query_input();
+                    } else {
+                        self.set_error("Not connected. Press c to connect.".to_string());
+                    }
+                    return false;
+                }
+                // h = SQL history
+                if key.code == KeyCode::Char('H') && !self.sql_history.is_empty() {
+                    self.show_sql_history();
+                    return false;
+                }
+            }
             _ => {}
         }
 
@@ -1009,6 +1267,47 @@ impl App {
                             }
                         }
                     }
+                    InputMode::RdsUsername => {
+                        self.input_mode = InputMode::None;
+                        if !value.is_empty() {
+                            self.pending_rds_user = value;
+                            self.input_mode = InputMode::RdsPassword;
+                            self.input.show_password("Password", "enter password...");
+                        }
+                    }
+                    InputMode::RdsPassword => {
+                        self.input_mode = InputMode::None;
+                        self.pending_rds_password = value;
+                        self.input_mode = InputMode::RdsDatabase;
+                        let default_db = self
+                            .rds_instances
+                            .selected()
+                            .and_then(|i| i.db_name.clone())
+                            .unwrap_or_default();
+                        if default_db.is_empty() {
+                            self.input
+                                .show("Database (optional, Enter to skip)", "database name...");
+                        } else {
+                            self.input.show_with_value(
+                                "Database (optional, Enter to skip)",
+                                "database name...",
+                                &default_db,
+                            );
+                        }
+                    }
+                    InputMode::RdsDatabase => {
+                        self.input_mode = InputMode::None;
+                        let database = if value.is_empty() { None } else { Some(value) };
+                        self.finalize_rds_connection(database);
+                    }
+                    InputMode::SqlQuery => {
+                        self.input_mode = InputMode::None;
+                        if !value.is_empty() {
+                            self.add_to_sql_history(&value);
+                            self.last_sql_query = value.clone();
+                            self.spawn_execute_query(&value);
+                        }
+                    }
                     InputMode::None => {}
                 }
             }
@@ -1026,6 +1325,42 @@ impl App {
             Some(a) => a,
             None => return,
         };
+
+        // Handle actions that don't need the runner
+        if let PendingAction::SaveRdsCredentials {
+            profile,
+            identifier,
+            username,
+            password,
+            database,
+        } = action
+        {
+            let encoded = credentials::encode_password(&password);
+            self.saved_credentials
+                .profiles
+                .entry(profile)
+                .or_default()
+                .rds
+                .insert(
+                    identifier.clone(),
+                    credentials::RdsCredential {
+                        username,
+                        password: encoded,
+                        database,
+                    },
+                );
+            match credentials::save(&self.saved_credentials) {
+                Ok(()) => {
+                    self.credentials_just_saved = true;
+                    self.set_info(format!("Credentials saved for {identifier}"));
+                }
+                Err(e) => {
+                    self.set_error(format!("Failed to save: {e}"));
+                }
+            }
+            return;
+        }
+
         let runner = match &self.runner {
             Some(r) => Arc::clone(r),
             None => return,
@@ -1059,6 +1394,9 @@ impl App {
                     Err(e) => log::error!("stop task error: {e}"),
                 });
                 self.spawn_load_tasks();
+            }
+            PendingAction::SaveRdsCredentials { .. } => {
+                // Handled above before runner extraction
             }
         }
     }
@@ -1141,6 +1479,10 @@ impl App {
                 self.logs_visited = true;
                 self.spawn_load_log_groups();
             }
+            TAB_RDS if !self.rds_visited => {
+                self.rds_visited = true;
+                self.spawn_load_rds_instances();
+            }
             _ => {}
         }
     }
@@ -1163,6 +1505,9 @@ impl App {
             }
             TAB_LOGS => {
                 self.spawn_load_log_groups();
+            }
+            TAB_RDS => {
+                self.spawn_load_rds_instances();
             }
             _ => {}
         }
@@ -1193,6 +1538,12 @@ impl App {
                 2 => self.log_viewer.move_up(),
                 _ => {}
             },
+            TAB_RDS => match self.active_panel {
+                0 => self.rds_instances.move_up(),
+                1 => self.rds_tables.move_up(),
+                2 => self.query_results.move_up(),
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -1220,6 +1571,12 @@ impl App {
                 0 => self.log_groups.move_down(),
                 1 => self.log_streams.move_down(),
                 2 => self.log_viewer.move_down(),
+                _ => {}
+            },
+            TAB_RDS => match self.active_panel {
+                0 => self.rds_instances.move_down(),
+                1 => self.rds_tables.move_down(),
+                2 => self.query_results.move_down(),
                 _ => {}
             },
             _ => {}
@@ -1264,6 +1621,19 @@ impl App {
                 } else if self.active_panel == 1 {
                     // Select stream → focus on log viewer
                     self.active_panel = 2;
+                }
+            }
+            TAB_RDS => {
+                if self.active_panel == 1 {
+                    // Select table → SELECT * FROM table
+                    if let Some(table) = self.rds_tables.selected().cloned() {
+                        if self.rds_connection.is_some() {
+                            let query = format!("SELECT * FROM `{table}` LIMIT 100");
+                            self.add_to_sql_history(&query);
+                            self.last_sql_query = query.clone();
+                            self.spawn_execute_query(&query);
+                        }
+                    }
                 }
             }
             _ => {}
@@ -1312,7 +1682,7 @@ impl App {
                 } else if self.is_in_rect(col, row, self.hit_bottom_panel) {
                     self.active_panel = 1;
                 } else if self.is_in_rect(col, row, self.hit_right_panel)
-                    && self.active_tab == TAB_LOGS
+                    && (self.active_tab == TAB_LOGS || self.active_tab == TAB_RDS)
                 {
                     self.active_panel = 2;
                 }
@@ -1325,7 +1695,7 @@ impl App {
                     self.active_panel = 1;
                     self.navigate_up();
                 } else if self.is_in_rect(col, row, self.hit_right_panel)
-                    && self.active_tab == TAB_LOGS
+                    && (self.active_tab == TAB_LOGS || self.active_tab == TAB_RDS)
                 {
                     self.active_panel = 2;
                     self.navigate_up();
@@ -1339,7 +1709,7 @@ impl App {
                     self.active_panel = 1;
                     self.navigate_down();
                 } else if self.is_in_rect(col, row, self.hit_right_panel)
-                    && self.active_tab == TAB_LOGS
+                    && (self.active_tab == TAB_LOGS || self.active_tab == TAB_RDS)
                 {
                     self.active_panel = 2;
                     self.navigate_down();
@@ -1377,7 +1747,7 @@ impl App {
         render_tab_bar(self.active_tab, tab_area, f.buffer_mut());
 
         // Content: left (50%) + right (50%)
-        let h_ratio = if self.active_tab == TAB_LOGS {
+        let h_ratio = if self.active_tab == TAB_LOGS || self.active_tab == TAB_RDS {
             25
         } else {
             self.split_horizontal
@@ -1508,6 +1878,33 @@ impl App {
                     f.buffer_mut(),
                     self.active_panel == 2,
                 );
+            }
+            TAB_RDS => {
+                self.rds_instances.render(
+                    top_panel_area,
+                    f.buffer_mut(),
+                    self.active_panel == 0,
+                    self.loading_rds_instances,
+                );
+                self.rds_tables.render(
+                    bottom_panel_area,
+                    f.buffer_mut(),
+                    self.active_panel == 1,
+                    self.loading_rds_tables,
+                );
+                if self.rds_connection.is_some() {
+                    self.query_results.render(
+                        right_area,
+                        f.buffer_mut(),
+                        self.active_panel == 2,
+                        self.loading_query,
+                    );
+                } else {
+                    if let Some(inst) = self.rds_instances.selected() {
+                        self.detail.set_lines(format_rds_instance_detail(inst));
+                    }
+                    self.detail.render(right_area, f.buffer_mut(), false);
+                }
             }
             _ => {}
         }
@@ -1663,6 +2060,12 @@ impl App {
                     self.log_viewer.filter.clone()
                 }
             }
+            TAB_RDS => match self.active_panel {
+                0 => self.rds_instances.filter.clone(),
+                1 => self.rds_tables.filter.clone(),
+                2 => self.query_results.filter.clone(),
+                _ => String::new(),
+            },
             _ => String::new(),
         }
     }
@@ -1693,6 +2096,12 @@ impl App {
                     self.log_viewer.set_filter(filter);
                 }
             }
+            TAB_RDS => match self.active_panel {
+                0 => self.rds_instances.set_filter(filter),
+                1 => self.rds_tables.set_filter(filter),
+                2 => self.query_results.set_filter(filter),
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -1760,6 +2169,14 @@ impl App {
                 }
             }
             TAB_SSM => self.instances.selected().map(|i| i.id.clone()),
+            TAB_RDS => match self.active_panel {
+                1 => self.rds_tables.selected().cloned(),
+                2 => self.query_results.selected_line(),
+                _ => self
+                    .rds_instances
+                    .selected()
+                    .map(|i| i.db_instance_arn.clone()),
+            },
             TAB_LOGS => {
                 if self.active_panel == 2 {
                     // Copy the full selected log line
@@ -2489,6 +2906,493 @@ impl App {
         });
     }
 
+    fn spawn_load_rds_instances(&mut self) {
+        if self.loading_rds_instances {
+            return;
+        }
+        let runner = match &self.runner {
+            Some(r) => Arc::clone(r),
+            None => return,
+        };
+        self.loading_rds_instances = true;
+        self.spinner.start("Loading RDS instances...");
+        let tx = self.bg_tx.clone();
+        thread::spawn(move || match runner.list_db_instances() {
+            Ok(instances) => {
+                let _ = tx.send(BgMsg::DbInstancesLoaded(instances));
+            }
+            Err(e) => {
+                let _ = tx.send(BgMsg::DbInstancesError(e));
+            }
+        });
+    }
+
+    fn handle_rds_connect(&mut self) {
+        let inst = match self.rds_instances.selected() {
+            Some(i) => i,
+            None => {
+                self.set_error("No RDS instance selected".to_string());
+                return;
+            }
+        };
+        if inst.endpoint.is_none() {
+            self.set_error("Instance has no endpoint (still creating?)".to_string());
+            return;
+        }
+        self.choice_mode = ChoiceMode::RdsConnectMethod;
+        self.choice.show(
+            "Connect Method",
+            vec![
+                Choice {
+                    key: '1',
+                    label: "Direct connection".to_string(),
+                },
+                Choice {
+                    key: '2',
+                    label: "SSM tunnel".to_string(),
+                },
+            ],
+        );
+    }
+
+    fn start_rds_connect_flow(&mut self) {
+        let inst = match self.rds_instances.selected() {
+            Some(i) => i,
+            None => return,
+        };
+        let identifier = inst.db_instance_identifier.clone();
+        let master_user = inst.master_username.clone();
+
+        // Check for saved credentials (nested: profile -> rds -> identifier)
+        let profile = self.active_profile.as_deref().unwrap_or("default");
+        let saved_lookup = self
+            .saved_credentials
+            .profiles
+            .get(profile)
+            .and_then(|p| p.rds.get(&identifier));
+        if let Some(saved) = saved_lookup {
+            if let Ok(password) = credentials::decode_password(&saved.password) {
+                self.pending_rds_user = saved.username.clone();
+                self.pending_rds_password = password;
+                self.credentials_just_saved = true; // don't re-prompt to save
+                let database = saved.database.clone();
+                self.finalize_rds_connection(database);
+                return;
+            }
+        }
+
+        // No saved credentials — normal flow
+        self.credentials_just_saved = false;
+        self.input_mode = InputMode::RdsUsername;
+        if master_user.is_empty() {
+            self.input.show("Username", "mysql username...");
+        } else {
+            self.input
+                .show_with_value("Username", "mysql username...", &master_user);
+        }
+    }
+
+    fn finalize_rds_connection(&mut self, database: Option<String>) {
+        let inst = match self.rds_instances.selected() {
+            Some(i) => i,
+            None => return,
+        };
+        let endpoint = match &inst.endpoint {
+            Some(e) => e,
+            None => return,
+        };
+
+        // If SSM tunnel is active, connect via localhost
+        let (host, port) = if let Some(local_port) = self.ssm_tunnel_local_port {
+            ("127.0.0.1".to_string(), local_port)
+        } else {
+            (endpoint.address.clone(), endpoint.port)
+        };
+
+        let conn = RdsConnection {
+            host,
+            port,
+            user: std::mem::take(&mut self.pending_rds_user),
+            password: std::mem::take(&mut self.pending_rds_password),
+            database,
+        };
+
+        self.rds_connection = Some(conn);
+        self.spinner.start("Testing connection...");
+        self.spawn_test_rds_connection();
+    }
+
+    fn start_ssm_tunnel_flow(&mut self) {
+        // If SSM instances are already loaded (from SSM tab), show selector directly
+        if !self.instances.instances.is_empty() {
+            self.tunnel_ssm_instances = self.instances.instances.clone();
+            self.show_ssm_instance_selector();
+            return;
+        }
+
+        // Otherwise, load them in background first
+        let runner = match &self.runner {
+            Some(r) => Arc::clone(r),
+            None => return,
+        };
+        self.spinner.start("Loading SSM instances...");
+        let tx = self.bg_tx.clone();
+        thread::spawn(move || match runner.list_instances() {
+            Ok(instances) => {
+                let _ = tx.send(BgMsg::SsmInstancesForTunnel(instances));
+            }
+            Err(e) => {
+                let _ = tx.send(BgMsg::SsmInstancesForTunnelError(e));
+            }
+        });
+    }
+
+    fn show_ssm_instance_selector(&mut self) {
+        if self.tunnel_ssm_instances.is_empty() {
+            self.set_error("No SSM-managed instances found in this region".to_string());
+            return;
+        }
+        let choices: Vec<Choice> = self
+            .tunnel_ssm_instances
+            .iter()
+            .enumerate()
+            .take(9)
+            .map(|(i, inst)| {
+                let key = (b'1' + i as u8) as char;
+                let label = if inst.name.is_empty() {
+                    inst.id.clone()
+                } else {
+                    format!("{} ({})", inst.name, inst.id)
+                };
+                Choice { key, label }
+            })
+            .collect();
+        self.choice_mode = ChoiceMode::SsmInstanceSelector;
+        self.choice.show("Select bastion instance", choices);
+    }
+
+    fn open_ssm_tunnel(&mut self, ssm_target: &str) {
+        let inst = match self.rds_instances.selected() {
+            Some(i) => i,
+            None => return,
+        };
+        let endpoint = match &inst.endpoint {
+            Some(e) => e,
+            None => return,
+        };
+
+        // Find a free local port
+        let local_port = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => {
+                let port = listener
+                    .local_addr()
+                    .map(|a| a.port() as i32)
+                    .unwrap_or(13306);
+                drop(listener);
+                port
+            }
+            Err(_) => 13306,
+        };
+
+        let remote_host = endpoint.address.clone();
+        let remote_port = endpoint.port;
+
+        log::info!(
+            "starting SSM tunnel: {} -> {}:{} via {}",
+            local_port,
+            remote_host,
+            remote_port,
+            ssm_target
+        );
+
+        self.spinner.start("Opening SSM tunnel...");
+
+        let remote_port_str = remote_port.to_string();
+        let local_port_str = local_port.to_string();
+        let params = format!(
+            "{{\"host\":[\"{remote_host}\"],\"portNumber\":[\"{remote_port_str}\"],\"localPortNumber\":[\"{local_port_str}\"]}}"
+        );
+
+        let aws_bin = self.aws_bin.clone();
+        let profile = self.active_profile.clone().unwrap_or_default();
+        let region = self.active_region.clone();
+        let ssm_target = ssm_target.to_string();
+
+        let tx = self.bg_tx.clone();
+        self.pending_ssm_tunnel = true;
+        self.ssm_tunnel_local_port = Some(local_port);
+
+        thread::spawn(move || {
+            let child = std::process::Command::new(&aws_bin)
+                .args([
+                    "ssm",
+                    "start-session",
+                    "--target",
+                    &ssm_target,
+                    "--document-name",
+                    "AWS-StartPortForwardingSessionToRemoteHost",
+                    "--parameters",
+                    &params,
+                    "--profile",
+                    &profile,
+                    "--region",
+                    &region,
+                ])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn();
+
+            match child {
+                Ok(child) => {
+                    let pid = child.id();
+                    // Detach: forget the Child so its stdout/stderr pipes stay open
+                    // and the process keeps running. We track it by PID and kill it
+                    // via kill_process() on disconnect.
+                    std::mem::forget(child);
+
+                    // Wait for the tunnel to be ready, retry up to 3 times
+                    for attempt in 0..3 {
+                        std::thread::sleep(std::time::Duration::from_secs(2 + attempt));
+                        let addr: std::net::SocketAddr =
+                            format!("127.0.0.1:{local_port}").parse().unwrap();
+                        if std::net::TcpStream::connect_timeout(
+                            &addr,
+                            std::time::Duration::from_secs(2),
+                        )
+                        .is_ok()
+                        {
+                            let _ = tx.send(BgMsg::SsmTunnelReady { pid });
+                            return;
+                        }
+                    }
+                    kill_process(pid);
+                    let _ = tx.send(BgMsg::SsmTunnelError(format!(
+                        "Tunnel started but port {local_port} not reachable after retries"
+                    )));
+                }
+                Err(e) => {
+                    let _ = tx.send(BgMsg::SsmTunnelError(format!(
+                        "Failed to start tunnel: {e}"
+                    )));
+                }
+            }
+        });
+    }
+
+    fn kill_ssm_tunnel(&mut self) {
+        if let Some(pid) = self.ssm_tunnel_pid.take() {
+            log::info!("killing SSM tunnel pid {pid}");
+            kill_process(pid);
+        }
+        self.ssm_tunnel_local_port = None;
+        self.pending_ssm_tunnel = false;
+    }
+
+    fn spawn_test_rds_connection(&mut self) {
+        let conn = match &self.rds_connection {
+            Some(c) => c,
+            None => return,
+        };
+        let host = conn.host.clone();
+        let port = conn.port;
+        let user = conn.user.clone();
+        let password = conn.password.clone();
+        let database = conn.database.clone();
+        let tx = self.bg_tx.clone();
+
+        thread::spawn(move || {
+            log::info!("testing MySQL connection to {host}:{port} as {user}");
+            let mut args = vec![
+                "-h".to_string(),
+                host,
+                "-P".to_string(),
+                port.to_string(),
+                "-u".to_string(),
+                user,
+                format!("--password={password}"),
+                "-e".to_string(),
+                "SELECT 1".to_string(),
+                "--batch".to_string(),
+            ];
+            if let Some(db) = database {
+                args.push(db);
+            }
+            let output = std::process::Command::new("mysql").args(&args).output();
+            match output {
+                Ok(out) if out.status.success() => {
+                    log::info!("MySQL connection OK");
+                    let _ = tx.send(BgMsg::RdsConnectionOk);
+                }
+                Ok(out) => {
+                    let err = String::from_utf8_lossy(&out.stderr).to_string();
+                    log::error!("MySQL connection failed: {err}");
+                    let _ = tx.send(BgMsg::RdsConnectionError(err));
+                }
+                Err(e) => {
+                    log::error!("MySQL command error: {e}");
+                    let _ = tx.send(BgMsg::RdsConnectionError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn spawn_load_rds_tables(&mut self) {
+        let conn = match &self.rds_connection {
+            Some(c) => c,
+            None => return,
+        };
+        self.loading_rds_tables = true;
+        self.spinner.start("Loading tables...");
+        let host = conn.host.clone();
+        let port = conn.port;
+        let user = conn.user.clone();
+        let password = conn.password.clone();
+        let database = conn.database.clone();
+        let tx = self.bg_tx.clone();
+
+        thread::spawn(move || {
+            let mut args = vec![
+                "-h".to_string(),
+                host,
+                "-P".to_string(),
+                port.to_string(),
+                "-u".to_string(),
+                user,
+                format!("--password={password}"),
+                "-e".to_string(),
+                "SHOW TABLES".to_string(),
+                "--batch".to_string(),
+                "--raw".to_string(),
+            ];
+            if let Some(db) = database {
+                args.push(db);
+            }
+            let output = std::process::Command::new("mysql").args(&args).output();
+            match output {
+                Ok(out) if out.status.success() => {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    // Skip the header line (column name)
+                    let tables: Vec<String> = text
+                        .lines()
+                        .skip(1)
+                        .map(|l| l.to_string())
+                        .filter(|l| !l.is_empty())
+                        .collect();
+                    let _ = tx.send(BgMsg::RdsTablesLoaded(tables));
+                }
+                Ok(out) => {
+                    let err = String::from_utf8_lossy(&out.stderr).to_string();
+                    let _ = tx.send(BgMsg::RdsTablesError(err));
+                }
+                Err(e) => {
+                    let _ = tx.send(BgMsg::RdsTablesError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn spawn_execute_query(&mut self, sql: &str) {
+        let conn = match &self.rds_connection {
+            Some(c) => c,
+            None => return,
+        };
+        self.loading_query = true;
+        self.spinner.start("Executing query...");
+        let host = conn.host.clone();
+        let port = conn.port;
+        let user = conn.user.clone();
+        let password = conn.password.clone();
+        let database = conn.database.clone();
+        let sql = sql.to_string();
+        let tx = self.bg_tx.clone();
+
+        thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let mut args = vec![
+                "-h".to_string(),
+                host,
+                "-P".to_string(),
+                port.to_string(),
+                "-u".to_string(),
+                user,
+                format!("--password={password}"),
+                "-e".to_string(),
+                sql.clone(),
+                "--batch".to_string(),
+                "--raw".to_string(),
+            ];
+            if let Some(db) = database {
+                args.push(db);
+            }
+            let output = std::process::Command::new("mysql").args(&args).output();
+            let elapsed = start.elapsed().as_millis() as u64;
+            match output {
+                Ok(out) if out.status.success() => {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    let (columns, rows) = parse_mysql_batch_output(&text);
+                    let _ = tx.send(BgMsg::QueryResult {
+                        columns,
+                        rows,
+                        duration_ms: elapsed,
+                        query: sql,
+                    });
+                }
+                Ok(out) => {
+                    let err = String::from_utf8_lossy(&out.stderr).to_string();
+                    let _ = tx.send(BgMsg::QueryError(err));
+                }
+                Err(e) => {
+                    let _ = tx.send(BgMsg::QueryError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn show_sql_query_input(&mut self) {
+        self.input_mode = InputMode::SqlQuery;
+        let history_hint = if self.sql_history.is_empty() {
+            String::new()
+        } else {
+            format!("  [Shift+H: history ({})]", self.sql_history.len())
+        };
+        if self.last_sql_query.is_empty() {
+            self.input
+                .show(&format!("SQL Query{history_hint}"), "SELECT * FROM ...");
+        } else {
+            self.input.show_with_value(
+                &format!("SQL Query{history_hint}"),
+                "SELECT * FROM ...",
+                &self.last_sql_query.clone(),
+            );
+        }
+    }
+
+    fn show_sql_history(&mut self) {
+        let choices: Vec<Choice> = self
+            .sql_history
+            .iter()
+            .enumerate()
+            .take(9)
+            .map(|(i, q)| {
+                let key = (b'1' + i as u8) as char;
+                let label = if q.len() > 60 {
+                    format!("{}...", &q[..60])
+                } else {
+                    q.clone()
+                };
+                Choice { key, label }
+            })
+            .collect();
+        self.choice_mode = ChoiceMode::SqlHistory;
+        self.choice.show("SQL History", choices);
+    }
+
+    fn add_to_sql_history(&mut self, query: &str) {
+        self.sql_history.retain(|q| q != query);
+        self.sql_history.insert(0, query.to_string());
+        self.sql_history.truncate(10);
+    }
+
     fn spawn_load_caller_identity(&mut self) {
         let runner = match &self.runner {
             Some(r) => Arc::clone(r),
@@ -2591,11 +3495,17 @@ impl App {
         self.instances.set_instances(vec![]);
         self.log_groups.set_groups(vec![]);
         self.log_streams.set_streams(vec![]);
+        self.rds_instances.set_instances(vec![]);
+        self.rds_tables.set_tables(vec![]);
+        self.query_results.clear();
+        self.rds_connection = None;
+        self.kill_ssm_tunnel();
         self.caller_identity = None;
         self.selected_cluster = None;
         self.selected_service = None;
         self.ssm_visited = false;
         self.logs_visited = false;
+        self.rds_visited = false;
         self.err = None;
 
         if is_sso_profile(profile) {
@@ -2893,6 +3803,95 @@ fn format_instance_detail(inst: &aws::Instance) -> Vec<String> {
 
     if let Some(ref ver) = inst.ssm_agent_version {
         lines.push(format!("SSM Agent     {}", ver));
+    }
+
+    lines
+}
+
+fn parse_mysql_batch_output(text: &str) -> (Vec<String>, Vec<Vec<String>>) {
+    let mut lines = text.lines();
+    let columns: Vec<String> = match lines.next() {
+        Some(header) => header.split('\t').map(|s| s.to_string()).collect(),
+        None => return (vec![], vec![]),
+    };
+    let rows: Vec<Vec<String>> = lines
+        .filter(|line| !line.is_empty())
+        .map(|line| line.split('\t').map(|s| s.to_string()).collect())
+        .collect();
+    (columns, rows)
+}
+
+fn format_rds_instance_detail(inst: &aws::DbInstance) -> Vec<String> {
+    let mut lines = vec![
+        format!("Identifier    {}", inst.db_instance_identifier),
+        format!("ARN           {}", inst.db_instance_arn),
+        format!("Engine        {} {}", inst.engine, inst.engine_version),
+        format!("Status        {}", inst.db_instance_status),
+        format!("Class         {}", inst.db_instance_class),
+    ];
+
+    if let Some(ref endpoint) = inst.endpoint {
+        lines.push(String::new());
+        lines.push(format!(
+            "Endpoint      {}:{}",
+            endpoint.address, endpoint.port
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push(format!("Master user   {}", inst.master_username));
+    if let Some(ref db_name) = inst.db_name {
+        lines.push(format!("Database      {}", db_name));
+    }
+
+    lines.push(String::new());
+    lines.push(format!(
+        "Storage       {} GB ({})",
+        inst.allocated_storage, inst.storage_type
+    ));
+    lines.push(format!(
+        "Multi-AZ      {}",
+        if inst.multi_az { "yes" } else { "no" }
+    ));
+    lines.push(format!(
+        "Encrypted     {}",
+        if inst.storage_encrypted { "yes" } else { "no" }
+    ));
+    lines.push(format!(
+        "Public        {}",
+        if inst.publicly_accessible {
+            "yes"
+        } else {
+            "no"
+        }
+    ));
+    lines.push(format!(
+        "IAM Auth      {}",
+        if inst.iam_database_authentication_enabled {
+            "yes"
+        } else {
+            "no"
+        }
+    ));
+    lines.push(format!("AZ            {}", inst.availability_zone));
+
+    if let Some(ref subnet) = inst.db_subnet_group {
+        lines.push(String::new());
+        lines.push(format!("Subnet group  {}", subnet.db_subnet_group_name));
+        lines.push(format!("VPC           {}", subnet.vpc_id));
+    }
+
+    if !inst.vpc_security_groups.is_empty() {
+        lines.push(String::new());
+        lines.push("Security Groups".to_string());
+        for sg in &inst.vpc_security_groups {
+            lines.push(format!("  {} ({})", sg.vpc_security_group_id, sg.status));
+        }
+    }
+
+    if let Some(ref created) = inst.instance_create_time {
+        lines.push(String::new());
+        lines.push(format!("Created       {}", created));
     }
 
     lines

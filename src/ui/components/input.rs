@@ -14,7 +14,8 @@ pub struct InputBox {
     label: String,
     placeholder: String,
     visible: bool,
-    scroll_x: usize, // horizontal scroll offset
+    scroll_x: usize,     // horizontal scroll offset
+    password_mode: bool, // display * instead of chars
 }
 
 impl Default for InputBox {
@@ -32,6 +33,7 @@ impl InputBox {
             placeholder: String::new(),
             visible: false,
             scroll_x: 0,
+            password_mode: false,
         }
     }
 
@@ -42,6 +44,7 @@ impl InputBox {
         self.cursor = 0;
         self.scroll_x = 0;
         self.visible = true;
+        self.password_mode = false;
     }
 
     pub fn show_with_value(&mut self, label: &str, placeholder: &str, initial: &str) {
@@ -51,6 +54,12 @@ impl InputBox {
         self.cursor = self.value.len();
         self.scroll_x = 0;
         self.visible = true;
+        self.password_mode = false;
+    }
+
+    pub fn show_password(&mut self, label: &str, placeholder: &str) {
+        self.show(label, placeholder);
+        self.password_mode = true;
     }
 
     pub fn hide(&mut self) {
@@ -80,20 +89,36 @@ impl InputBox {
                 self.hide();
                 Some(Action::InputCancel)
             }
-            KeyCode::Char(c) => {
+            // Ctrl+H (Ctrl+Backspace on most terminals) / Ctrl+W: delete previous word
+            KeyCode::Char('h' | 'w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let target = self.prev_word_boundary();
+                self.value.drain(target..self.cursor);
+                self.cursor = target;
+                None
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.value.insert(self.cursor, c);
                 self.cursor += 1;
                 None
             }
             KeyCode::Backspace => {
-                if self.cursor > 0 {
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    // Delete previous word
+                    let target = self.prev_word_boundary();
+                    self.value.drain(target..self.cursor);
+                    self.cursor = target;
+                } else if self.cursor > 0 {
                     self.cursor -= 1;
                     self.value.remove(self.cursor);
                 }
                 None
             }
             KeyCode::Delete => {
-                if self.cursor < self.value.len() {
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    // Delete next word
+                    let target = self.next_word_boundary();
+                    self.value.drain(self.cursor..target);
+                } else if self.cursor < self.value.len() {
                     self.value.remove(self.cursor);
                 }
                 None
@@ -244,13 +269,14 @@ impl InputBox {
         for (i, &ch) in visible_chars.iter().enumerate() {
             let abs_pos = i + scroll;
             let x = inner.x + 1 + i as u16;
+            let display_ch = if self.password_mode { '*' } else { ch };
             if abs_pos == self.cursor {
-                buf.set_string(x, y_field, ch.to_string(), cursor_style);
+                buf.set_string(x, y_field, display_ch.to_string(), cursor_style);
             } else {
                 buf.set_string(
                     x,
                     y_field,
-                    ch.to_string(),
+                    display_ch.to_string(),
                     text_style.bg(theme::color_secondary()),
                 );
             }

@@ -21,6 +21,7 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 fuzzy-matcher = "0.3"
 ansi-to-tui = "7"
+base64 = "0.22"
 chrono = "0.4"
 portable-pty = "0.8"
 vt100 = "0.15"

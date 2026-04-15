@@ -188,7 +188,7 @@ fn help_sections() -> Vec<HelpSection> {
                     desc: "navigate up/down".to_string(),
                 },
                 Hint {
-                    key: "1/2/3/4".to_string(),
+                    key: "1/2/3/4/5".to_string(),
                     desc: "switch tab".to_string(),
                 },
                 Hint {
@@ -279,6 +279,31 @@ fn help_sections() -> Vec<HelpSection> {
                 Hint {
                     key: "PgUp/PgDn".to_string(),
                     desc: "page up/down in logs".to_string(),
+                },
+            ],
+        },
+        HelpSection {
+            title: "RDS".to_string(),
+            bindings: vec![
+                Hint {
+                    key: "c".to_string(),
+                    desc: "connect to instance".to_string(),
+                },
+                Hint {
+                    key: "s".to_string(),
+                    desc: "run SQL query".to_string(),
+                },
+                Hint {
+                    key: "d".to_string(),
+                    desc: "disconnect".to_string(),
+                },
+                Hint {
+                    key: "H".to_string(),
+                    desc: "SQL query history".to_string(),
+                },
+                Hint {
+                    key: "enter".to_string(),
+                    desc: "SELECT * from selected table".to_string(),
                 },
             ],
         },
@@ -390,6 +415,6 @@ mod tests {
 
     #[test]
     fn help_sections_count() {
-        assert_eq!(help_sections().len(), 7);
+        assert_eq!(help_sections().len(), 8);
     }
 }
