@@ -5,7 +5,7 @@
 ```bash
 cargo build              # Debug build
 cargo build --release    # Release build
-cargo test               # Run all 50 tests
+cargo test               # Run all tests
 cargo clippy -- -D warnings  # Lint (must pass with zero warnings)
 cargo fmt                # Format code
 cargo fmt -- --check     # Check formatting without modifying
@@ -22,15 +22,17 @@ Always run `cargo fmt && cargo clippy -- -D warnings` before committing.
 src/
   aws/          # Domain layer - NO UI dependency
     exec.rs     # Executor trait, RealExecutor, StreamHandle, PTY streaming
-    runner.rs   # Typed wrapper: list_clusters(), list_services(), etc.
-    types.rs    # Cluster, Service, Task, Container, Instance, LogGroup...
+    runner.rs   # Typed wrapper: list_clusters(), list_services(), list_db_instances(), etc.
+    types.rs    # Cluster, Service, Task, Container, Instance, LogGroup, DbInstance...
   config/       # App config: resolve aws binary, profile, region
+  credentials.rs # Saved RDS credentials (~/.config/lazy-aws/credentials.json)
   logger/       # File logger -> ~/.local/state/lazy-aws/debug.log
   ui/
-    app.rs      # Main event loop (~3K lines) - THE central file
-    panels/     # 11 panel widgets (clusters, services, tasks, containers,
+    app.rs      # Main event loop - THE central file
+    panels/     # 14 panel widgets (clusters, services, tasks, containers,
                 #   instances, log_groups, log_streams, log_viewer,
-                #   detail, output, terminal)
+                #   detail, output, terminal, rds_instances, rds_tables,
+                #   query_results)
     components/ # 7 reusable widgets (tabbar, statusbar, spinner,
                 #   confirm, choice, input, help)
     style/      # Theme system (dark/light) with dynamic color functions
@@ -82,6 +84,14 @@ Every list panel has `filter: String`, `filtered: Vec<usize>`, `rebuild_filter()
 - **SSO token is shared across profiles**: All profiles with the same `sso_start_url` share one token. `switch_profile` tests credentials first (`spawn_check_credentials_then_load`) before triggering SSO login.
 - **`aws configure list-profiles` ignores `--output json`**: Returns plain text. Parsed directly in `spawn_load_profiles` using `std::process::Command` (not the Runner).
 - **Region auto-resolved from `~/.aws/config`**: `resolve_profile_region()` and `is_sso_profile()` parse the config file manually (INI format).
+- **SSM tunnel process must be detached**: `std::mem::forget(child)` is used in `open_ssm_tunnel()` to prevent the `Child` from being dropped (which closes its pipes and kills the process). The tunnel is tracked by PID and killed explicitly via `kill_process()`.
+- **Ctrl+Backspace sends Ctrl+H**: Most terminals send `Char('h')` + CONTROL for Ctrl+Backspace. The InputBox handles this explicitly to avoid inserting 'h'.
+- **RDS API uses PascalCase with DB prefix**: Fields like `DBInstanceIdentifier` (not `DbInstanceIdentifier`) need explicit `#[serde(rename)]` — `rename_all = "PascalCase"` alone doesn't match.
+
+## Files
+
+- **Debug log**: `~/.local/state/lazy-aws/debug.log` (truncated on startup)
+- **Saved credentials**: `~/.config/lazy-aws/credentials.json` (permissions 0600, passwords base64-encoded, keyed by profile/instance)
 
 ## app.rs Structure
 
@@ -101,8 +111,9 @@ The App struct has ~30 fields. Key state groups:
 | Tasks | 1 | Tasks / Containers | Detail or Terminal |
 | SSM | 2 | Instances / Sessions | Detail |
 | Logs | 3 | Log Groups / Log Streams | Log Viewer + Log Detail (split) |
+| RDS | 4 | RDS Instances / Tables | Detail (disconnected) or Query Results (connected) |
 
-Logs tab uses 25/75 horizontal split (vs 50/50 for other tabs).
+Logs and RDS tabs use 25/75 horizontal split (vs 50/50 for other tabs).
 
 ## Testing
 

@@ -157,6 +157,29 @@ pub fn default_hints(tab: usize) -> Vec<Hint> {
                 desc: "export".to_string(),
             });
         }
+        4 => {
+            // RDS
+            hints.push(Hint {
+                key: "c".to_string(),
+                desc: "connect".to_string(),
+            });
+            hints.push(Hint {
+                key: "s".to_string(),
+                desc: "SQL query".to_string(),
+            });
+            hints.push(Hint {
+                key: "d".to_string(),
+                desc: "disconnect".to_string(),
+            });
+            hints.push(Hint {
+                key: "e".to_string(),
+                desc: "export CSV".to_string(),
+            });
+            hints.push(Hint {
+                key: "i".to_string(),
+                desc: "import SQL".to_string(),
+            });
+        }
         _ => {}
     }
 

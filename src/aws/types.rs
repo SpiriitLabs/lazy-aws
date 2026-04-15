@@ -137,3 +137,65 @@ pub struct LogEvent {
     #[serde(rename = "ingestionTime")]
     pub ingestion_time: Option<i64>,
 }
+
+/// RDS DB Instance.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct DbInstance {
+    #[serde(rename = "DBInstanceIdentifier")]
+    pub db_instance_identifier: String,
+    #[serde(rename = "DBInstanceClass")]
+    pub db_instance_class: String,
+    pub engine: String,
+    pub engine_version: String,
+    #[serde(rename = "DBInstanceStatus")]
+    pub db_instance_status: String,
+    pub master_username: String,
+    #[serde(rename = "DBName")]
+    pub db_name: Option<String>,
+    pub endpoint: Option<DbEndpoint>,
+    pub allocated_storage: i32,
+    pub instance_create_time: Option<String>,
+    #[serde(rename = "MultiAZ")]
+    pub multi_az: bool,
+    pub publicly_accessible: bool,
+    pub storage_type: String,
+    #[serde(rename = "DBInstanceArn")]
+    pub db_instance_arn: String,
+    pub availability_zone: String,
+    pub storage_encrypted: bool,
+    #[serde(rename = "IAMDatabaseAuthenticationEnabled")]
+    pub iam_database_authentication_enabled: bool,
+    #[serde(rename = "VpcSecurityGroups")]
+    pub vpc_security_groups: Vec<VpcSecurityGroup>,
+    #[serde(rename = "DBSubnetGroup")]
+    pub db_subnet_group: Option<DbSubnetGroup>,
+}
+
+/// RDS DB Endpoint.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct DbEndpoint {
+    pub address: String,
+    pub port: i32,
+    pub hosted_zone_id: String,
+}
+
+/// VPC Security Group membership.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct VpcSecurityGroup {
+    pub vpc_security_group_id: String,
+    pub status: String,
+}
+
+/// RDS DB Subnet Group.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct DbSubnetGroup {
+    #[serde(rename = "DBSubnetGroupName")]
+    pub db_subnet_group_name: String,
+    #[serde(rename = "VpcId")]
+    pub vpc_id: String,
+    pub subnet_group_status: String,
+}

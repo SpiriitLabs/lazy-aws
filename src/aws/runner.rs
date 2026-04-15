@@ -456,6 +456,25 @@ impl Runner {
         Ok(profiles)
     }
 
+    pub fn list_db_instances(&self) -> Result<Vec<DbInstance>, String> {
+        let result = self.exec.run(&["rds", "describe-db-instances"])?;
+        check_exit(&result)?;
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&result.stdout).map_err(|e| format!("parse error: {e}"))?;
+
+        let instances: Vec<DbInstance> = parsed["DBInstances"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(instances)
+    }
+
     /// Returns the aws CLI binary path and args needed to run `aws sso login --profile <profile>`.
     /// The caller is responsible for running this command interactively (suspend TUI).
     pub fn sso_login_command(&self, profile: &str) -> (String, Vec<String>) {
