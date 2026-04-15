@@ -21,16 +21,18 @@ Built with [ratatui](https://ratatui.rs) + [crossterm](https://github.com/crosst
 - **ECS** — Browse clusters, services, tasks, and containers. Force new deployments, stop tasks, exec into containers
 - **SSM** — List EC2 instances with SSM agent, start interactive sessions
 - **CloudWatch Logs** — Browse log groups and streams, live tail in real-time, run Logs Insights queries with templates
+- **RDS** — Browse RDS/Aurora instances, connect via direct or SSM tunnel, run SQL queries in-TUI, browse tables, export results to CSV, import SQL files
 - **Profile management** — Switch AWS profiles on the fly, automatic SSO login for SSO profiles
-- **Search** — Filter any list with `/` (clusters, services, tasks, log groups...)
-- **Copy** — Press `y` to copy ARNs, IDs, or full log lines to clipboard
+- **Search** — Filter any list with `/` (clusters, services, tasks, log groups, query results...)
+- **Copy** — Press `y` to copy ARNs, IDs, table names, or query result rows to clipboard
 - **Light/Dark theme** — Auto-detects terminal background, toggle with `Ctrl+L`
 
 ## Prerequisites
 
 - Rust (stable)
 - [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) installed and configured
-- [session-manager-plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) (optional, required for ECS exec and SSM sessions — lazy-aws can install it for you)
+- [session-manager-plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) (optional, required for ECS exec, SSM sessions, and RDS SSM tunnels — lazy-aws can install it for you)
+- `mysql` CLI client (optional, required for the RDS tab — `mysql-client` or `mariadb-client` package)
 
 ## Installation
 
@@ -103,13 +105,41 @@ lazy-aws respects the standard AWS environment variables:
 
 When switching profiles, the region is automatically resolved from `~/.aws/config` (`region` or `sso_region` field).
 
+### Saved RDS credentials
+
+When connecting to an RDS instance, lazy-aws offers to save the credentials. They are stored in:
+
+```
+~/.config/lazy-aws/credentials.json
+```
+
+The file is created with `0600` permissions (owner read/write only). Passwords are base64-encoded (not stored in plain text). Credentials are organized by AWS profile and instance:
+
+```json
+{
+  "profiles": {
+    "my-profile": {
+      "rds": {
+        "my-db-instance": {
+          "username": "admin",
+          "password": "base64-encoded",
+          "database": "mydb"
+        }
+      }
+    }
+  }
+}
+```
+
+On subsequent connections, saved credentials are used automatically.
+
 ## Keybindings
 
 ### Global
 
 | Key | Action |
 |-----|--------|
-| `1` `2` `3` `4` | Switch tab (ECS / Tasks / SSM / Logs) |
+| `1` `2` `3` `4` `5` | Switch tab (ECS / Tasks / SSM / Logs / RDS) |
 | `Tab` / `Shift+Tab` | Next / previous panel |
 | `j` / `k` or `Up` / `Down` | Navigate up / down |
 | `Enter` | Select / drill-down |
@@ -154,12 +184,29 @@ When switching profiles, the region is automatically resolved from `~/.aws/confi
 | `g` / `G` | Go to top / bottom |
 | `PgUp` / `PgDn` | Page up / down |
 
+### RDS tab
+
+| Key | Action |
+|-----|--------|
+| `c` | Connect to selected instance (direct or SSM tunnel) |
+| `d` | Disconnect |
+| `s` | Run SQL query |
+| `H` | SQL query history |
+| `Enter` | SELECT * from selected table (on Tables panel) |
+| `e` | Export query results to CSV |
+| `i` | Import SQL file |
+| `h` / `l` | Scroll query results left / right |
+| `/` | Filter query results |
+
 ### Insights query editor
 
 | Key | Action |
 |-----|--------|
 | `Ctrl+E` | Pick from query templates |
 | `Ctrl+T` | Change time range |
+| `Ctrl+H` / `Ctrl+Backspace` | Delete previous word |
+| `Ctrl+W` | Delete previous word |
+| `Ctrl+Left` / `Ctrl+Right` | Jump to previous / next word |
 | `Enter` | Execute query |
 | `Esc` | Cancel |
 
@@ -206,13 +253,15 @@ src/
 │   ├── exec.rs     # Executor trait, RealExecutor, streaming
 │   └── runner.rs   # Typed wrapper over AWS CLI
 ├── config/         # Config resolution, binary validation
+├── credentials.rs  # Saved RDS credentials (load/save, base64 encode/decode)
 ├── logger/         # File logger (~/.local/state/lazy-aws/debug.log)
 └── ui/
     ├── app.rs      # Event loop, async loading, key routing
     ├── style/      # Color theme (dark/light) + style functions
     ├── components/ # TabBar, StatusBar, ConfirmDialog, InputBox, Spinner, Help
     └── panels/     # Clusters, Services, Tasks, Containers, Instances,
-                    # LogGroups, LogStreams, LogViewer, Detail, Output, Terminal
+                    # LogGroups, LogStreams, LogViewer, Detail, Output, Terminal,
+                    # RdsInstances, RdsTables, QueryResults
 ```
 
 All data loading is asynchronous (background threads + `mpsc` channels) so the UI stays responsive. Each AWS call runs in its own thread — if one fails, the others continue.
