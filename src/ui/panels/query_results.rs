@@ -232,7 +232,7 @@ impl QueryResultsPanel {
             buf.set_string(
                 inner.x + 1,
                 inner.y,
-                "No query results. Press s to run a query.",
+                "No query results. Press s for SELECT, e for modify.",
                 style,
             );
             return;
