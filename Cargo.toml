@@ -1,6 +1,6 @@
 [package]
 name = "lazy-aws"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A TUI for interacting with AWS services, inspired by lazygit"
 license = "MIT"
