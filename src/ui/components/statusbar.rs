@@ -168,11 +168,15 @@ pub fn default_hints(tab: usize) -> Vec<Hint> {
                 desc: "SQL query".to_string(),
             });
             hints.push(Hint {
+                key: "e".to_string(),
+                desc: "execute".to_string(),
+            });
+            hints.push(Hint {
                 key: "d".to_string(),
                 desc: "disconnect".to_string(),
             });
             hints.push(Hint {
-                key: "e".to_string(),
+                key: "E".to_string(),
                 desc: "export CSV".to_string(),
             });
             hints.push(Hint {

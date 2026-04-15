@@ -51,6 +51,7 @@ pub struct KeyMap {
     pub upload: KeyBinding,
     pub delete_object: KeyBinding,
     pub sort: KeyBinding,
+    pub sql_modify: KeyBinding,
 }
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -238,6 +239,11 @@ pub fn default_key_map() -> KeyMap {
             help_key: "s".to_string(),
             help_desc: "cycle sort".to_string(),
         },
+        sql_modify: KeyBinding {
+            keys: vec![key(KeyCode::Char('e'))],
+            help_key: "e".to_string(),
+            help_desc: "execute modify".to_string(),
+        },
     }
 }
 
@@ -284,6 +290,7 @@ mod tests {
             ("Upload", &km.upload),
             ("DeleteObject", &km.delete_object),
             ("Sort", &km.sort),
+            ("SqlModify", &km.sql_modify),
         ];
 
         for (name, binding) in bindings {

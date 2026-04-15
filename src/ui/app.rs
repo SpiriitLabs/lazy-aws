@@ -77,6 +77,11 @@ enum BgMsg {
         query: String,
     },
     QueryError(String),
+    DmlPreview {
+        sql: String,
+        affected_rows: u64,
+    },
+    DmlPreviewError(String),
     SsmTunnelReady {
         pid: u32,
     },
@@ -121,6 +126,7 @@ enum InputMode {
     RdsPassword,
     RdsDatabase,
     SqlQuery,
+    SqlModify,
     ExportQueryResults,
     ImportSql,
     S3Upload,
@@ -195,6 +201,9 @@ enum PendingAction {
     DeleteS3Object {
         bucket: String,
         key: String,
+    },
+    ExecuteDmlQuery {
+        sql: String,
     },
 }
 
@@ -306,6 +315,10 @@ pub struct App {
     insights_time_range: TimeRange,
     custom_date_start: String, // temp storage during custom date input
 
+    // RDS modify (DML/DDL)
+    last_sql_modify_query: String,
+    pending_dml_refresh: bool,
+
     // RDS import
     pending_import_sql: bool,
     pending_import_path: Option<String>,
@@ -414,6 +427,8 @@ impl App {
             pending_shell: None,
             insights_time_range: TimeRange::Relative(3600), // default 1h
             custom_date_start: String::new(),
+            last_sql_modify_query: String::new(),
+            pending_dml_refresh: false,
             pending_import_sql: false,
             pending_import_path: None,
             available_profiles: vec![],
@@ -720,11 +735,43 @@ impl App {
                     self.spinner.stop();
                     // Focus on right panel to see results
                     self.active_panel = 2;
+                    if self.pending_dml_refresh {
+                        self.pending_dml_refresh = false;
+                        self.spawn_load_rds_tables();
+                    }
                 }
                 BgMsg::QueryError(e) => {
                     self.loading_query = false;
                     self.query_results.set_error(e);
                     self.spinner.stop();
+                    self.active_panel = 2;
+                    if self.pending_dml_refresh {
+                        self.pending_dml_refresh = false;
+                    }
+                }
+                BgMsg::DmlPreview { sql, affected_rows } => {
+                    self.loading_query = false;
+                    self.spinner.stop();
+                    let truncated = if sql.len() > 80 {
+                        format!("{}...", &sql[..80])
+                    } else {
+                        sql.clone()
+                    };
+                    let rows_label = if affected_rows <= 1 {
+                        "ligne"
+                    } else {
+                        "lignes"
+                    };
+                    self.confirm.show(&format!(
+                        "Cette action va affecter {} {}.\nExecuter ?\n\n{}",
+                        affected_rows, rows_label, truncated
+                    ));
+                    self.pending_action = Some(PendingAction::ExecuteDmlQuery { sql });
+                }
+                BgMsg::DmlPreviewError(e) => {
+                    self.loading_query = false;
+                    self.spinner.stop();
+                    self.query_results.set_error(format!("Preview failed: {e}"));
                     self.active_panel = 2;
                 }
                 BgMsg::SsmTunnelReady { pid } => {
@@ -1283,8 +1330,17 @@ impl App {
                     self.show_sql_history();
                     return false;
                 }
-                // e = export query results to CSV
-                if key.code == KeyCode::Char('e') {
+                // e = SQL modify query (INSERT/UPDATE/DELETE/DDL)
+                if km.sql_modify.matches(&key) {
+                    if self.rds_connection.is_some() {
+                        self.show_sql_modify_input();
+                    } else {
+                        self.set_error("Not connected. Press c to connect.".to_string());
+                    }
+                    return false;
+                }
+                // E = export query results to CSV
+                if key.code == KeyCode::Char('E') {
                     self.handle_export_query_results();
                     return false;
                 }
@@ -1435,6 +1491,32 @@ impl App {
                             self.spawn_execute_query(&value);
                         }
                     }
+                    InputMode::SqlModify => {
+                        self.input_mode = InputMode::None;
+                        if !value.is_empty() {
+                            if !is_modification_query(&value) {
+                                self.set_error("Use 's' for SELECT queries.".to_string());
+                                return;
+                            }
+                            self.add_to_sql_history(&value);
+                            self.last_sql_modify_query = value.clone();
+                            if is_dml_query(&value) {
+                                // DML: preview first (transaction + rollback)
+                                self.spawn_preview_dml(&value);
+                            } else {
+                                // DDL: can't preview (implicit commit), confirm directly
+                                let truncated = if value.len() > 80 {
+                                    format!("{}...", &value[..80])
+                                } else {
+                                    value.clone()
+                                };
+                                self.confirm
+                                    .show(&format!("Execute modification query?\n\n{}", truncated));
+                                self.pending_action =
+                                    Some(PendingAction::ExecuteDmlQuery { sql: value });
+                            }
+                        }
+                    }
                     InputMode::ExportQueryResults => {
                         self.input_mode = InputMode::None;
                         if !value.is_empty() {
@@ -1501,6 +1583,18 @@ impl App {
             return;
         }
 
+        if let PendingAction::ExecuteDmlQuery { sql } = action {
+            let actual_sql = if is_dml_query(&sql) {
+                format!("{sql}; SELECT ROW_COUNT() AS 'Rows affected';")
+            } else {
+                sql.clone()
+            };
+            self.last_sql_query = sql;
+            self.pending_dml_refresh = true;
+            self.spawn_execute_query(&actual_sql);
+            return;
+        }
+
         let runner = match &self.runner {
             Some(r) => Arc::clone(r),
             None => return,
@@ -1550,6 +1644,9 @@ impl App {
                         let _ = tx.send(BgMsg::DeleteObjectError(e));
                     }
                 });
+            }
+            PendingAction::ExecuteDmlQuery { .. } => {
+                // Handled above before runner extraction
             }
         }
     }
@@ -3795,6 +3892,67 @@ impl App {
         });
     }
 
+    fn spawn_preview_dml(&mut self, sql: &str) {
+        let conn = match &self.rds_connection {
+            Some(c) => c,
+            None => return,
+        };
+        self.loading_query = true;
+        self.spinner.start("Previewing query...");
+        let host = conn.host.clone();
+        let port = conn.port;
+        let user = conn.user.clone();
+        let password = conn.password.clone();
+        let database = conn.database.clone();
+        let sql = sql.to_string();
+        let tx = self.bg_tx.clone();
+
+        thread::spawn(move || {
+            let preview_sql =
+                format!("START TRANSACTION; {sql}; SELECT ROW_COUNT() AS 'affected'; ROLLBACK;");
+            log::debug!("preview DML: mysql -e \"{preview_sql}\"");
+            let mut args = vec![
+                "-h".to_string(),
+                host,
+                "-P".to_string(),
+                port.to_string(),
+                "-u".to_string(),
+                user,
+                format!("--password={password}"),
+                "-e".to_string(),
+                preview_sql,
+                "--batch".to_string(),
+                "--raw".to_string(),
+            ];
+            if let Some(db) = database {
+                args.push(db);
+            }
+            let output = std::process::Command::new("mysql").args(&args).output();
+            match output {
+                Ok(out) if out.status.success() => {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    log::debug!("preview DML stdout: {text}");
+                    // Parse: header line "affected" then value line "N"
+                    let affected_rows = text
+                        .lines()
+                        .last()
+                        .and_then(|line| line.trim().parse::<u64>().ok())
+                        .unwrap_or(0);
+                    let _ = tx.send(BgMsg::DmlPreview { sql, affected_rows });
+                }
+                Ok(out) => {
+                    let err = String::from_utf8_lossy(&out.stderr).to_string();
+                    log::error!("preview DML error: {err}");
+                    let _ = tx.send(BgMsg::DmlPreviewError(err));
+                }
+                Err(e) => {
+                    log::error!("preview DML failed: {e}");
+                    let _ = tx.send(BgMsg::DmlPreviewError(e.to_string()));
+                }
+            }
+        });
+    }
+
     fn show_sql_query_input(&mut self) {
         self.input_mode = InputMode::SqlQuery;
         let history_hint = if self.sql_history.is_empty() {
@@ -3810,6 +3968,27 @@ impl App {
                 &format!("SQL Query{history_hint}"),
                 "SELECT * FROM ...",
                 &self.last_sql_query.clone(),
+            );
+        }
+    }
+
+    fn show_sql_modify_input(&mut self) {
+        self.input_mode = InputMode::SqlModify;
+        let history_hint = if self.sql_history.is_empty() {
+            String::new()
+        } else {
+            format!("  [Shift+H: history ({})]", self.sql_history.len())
+        };
+        if self.last_sql_modify_query.is_empty() {
+            self.input.show(
+                &format!("SQL Execute{history_hint}"),
+                "INSERT / UPDATE / DELETE / CREATE / DROP ...",
+            );
+        } else {
+            self.input.show_with_value(
+                &format!("SQL Execute{history_hint}"),
+                "INSERT / UPDATE / DELETE / CREATE / DROP ...",
+                &self.last_sql_modify_query.clone(),
             );
         }
     }
@@ -4461,6 +4640,23 @@ fn format_instance_detail(inst: &aws::Instance) -> Vec<String> {
     }
 
     lines
+}
+
+fn is_modification_query(sql: &str) -> bool {
+    let upper = sql.trim_start().to_uppercase();
+    upper.starts_with("INSERT")
+        || upper.starts_with("UPDATE")
+        || upper.starts_with("DELETE")
+        || upper.starts_with("DROP")
+        || upper.starts_with("ALTER")
+        || upper.starts_with("CREATE")
+        || upper.starts_with("TRUNCATE")
+        || upper.starts_with("RENAME")
+}
+
+fn is_dml_query(sql: &str) -> bool {
+    let upper = sql.trim_start().to_uppercase();
+    upper.starts_with("INSERT") || upper.starts_with("UPDATE") || upper.starts_with("DELETE")
 }
 
 fn parse_mysql_batch_output(text: &str) -> (Vec<String>, Vec<Vec<String>>) {
