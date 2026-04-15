@@ -110,6 +110,8 @@ enum InputMode {
     RdsPassword,
     RdsDatabase,
     SqlQuery,
+    ExportQueryResults,
+    ImportSql,
 }
 
 struct RdsConnection {
@@ -282,6 +284,10 @@ pub struct App {
     insights_time_range: TimeRange,
     custom_date_start: String, // temp storage during custom date input
 
+    // RDS import
+    pending_import_sql: bool,
+    pending_import_path: Option<String>,
+
     // Profile management
     available_profiles: Vec<String>,
     pending_sso_login: bool,
@@ -380,6 +386,8 @@ impl App {
             pending_shell: None,
             insights_time_range: TimeRange::Relative(3600), // default 1h
             custom_date_start: String::new(),
+            pending_import_sql: false,
+            pending_import_path: None,
             available_profiles: vec![],
             pending_sso_login: false,
             pending_exec: false,
@@ -483,6 +491,12 @@ impl App {
             if self.pending_exec {
                 self.pending_exec = false;
                 self.run_exec_interactive(&mut terminal)?;
+            }
+
+            // Handle SQL import (suspend TUI)
+            if self.pending_import_sql {
+                self.pending_import_sql = false;
+                self.run_import_sql_interactive(&mut terminal)?;
             }
 
             // Auto-refresh every 30 seconds (only if not loading)
@@ -1199,6 +1213,17 @@ impl App {
                     self.show_sql_history();
                     return false;
                 }
+                // e = export query results to CSV
+                if key.code == KeyCode::Char('e') {
+                    self.handle_export_query_results();
+                    return false;
+                }
+                // i = import SQL file
+                if key.code == KeyCode::Char('i') && self.rds_connection.is_some() {
+                    self.input_mode = InputMode::ImportSql;
+                    self.input.show("Import SQL file", "path to .sql file...");
+                    return false;
+                }
             }
             _ => {}
         }
@@ -1306,6 +1331,19 @@ impl App {
                             self.add_to_sql_history(&value);
                             self.last_sql_query = value.clone();
                             self.spawn_execute_query(&value);
+                        }
+                    }
+                    InputMode::ExportQueryResults => {
+                        self.input_mode = InputMode::None;
+                        if !value.is_empty() {
+                            self.export_query_results_to_file(&value);
+                        }
+                    }
+                    InputMode::ImportSql => {
+                        self.input_mode = InputMode::None;
+                        if !value.is_empty() {
+                            self.pending_import_path = Some(value);
+                            self.pending_import_sql = true;
                         }
                     }
                     InputMode::None => {}
@@ -2487,6 +2525,171 @@ impl App {
                 self.set_error(format!("Cannot create file: {e}"));
             }
         }
+    }
+
+    fn handle_export_query_results(&mut self) {
+        if self.query_results.columns.is_empty() {
+            self.set_error("No query results to export".to_string());
+            return;
+        }
+        let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S");
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let default_path = format!("{home}/lazy-aws-query-{timestamp}.csv");
+        self.input_mode = InputMode::ExportQueryResults;
+        self.input.show_with_value(
+            &format!("Export {} rows to CSV", self.query_results.rows.len()),
+            "file path...",
+            &default_path,
+        );
+    }
+
+    fn export_query_results_to_file(&mut self, path: &str) {
+        use std::io::Write;
+
+        if self.query_results.columns.is_empty() {
+            self.set_error("No query results to export".to_string());
+            return;
+        }
+
+        let expanded = if path.starts_with('~') {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            path.replacen('~', &home, 1)
+        } else {
+            path.to_string()
+        };
+
+        let mut csv = String::new();
+
+        // Header row
+        let header: Vec<String> = self
+            .query_results
+            .columns
+            .iter()
+            .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+            .collect();
+        csv.push_str(&header.join(","));
+        csv.push('\n');
+
+        // Data rows
+        for row in &self.query_results.rows {
+            let cells: Vec<String> = row
+                .iter()
+                .map(|cell| format!("\"{}\"", cell.replace('"', "\"\"")))
+                .collect();
+            csv.push_str(&cells.join(","));
+            csv.push('\n');
+        }
+
+        match std::fs::File::create(&expanded) {
+            Ok(mut file) => match file.write_all(csv.as_bytes()) {
+                Ok(()) => {
+                    self.set_info(format!(
+                        "Exported {} rows to {}",
+                        self.query_results.rows.len(),
+                        path
+                    ));
+                    log::info!(
+                        "exported {} rows to {expanded}",
+                        self.query_results.rows.len()
+                    );
+                }
+                Err(e) => {
+                    self.set_error(format!("Write error: {e}"));
+                }
+            },
+            Err(e) => {
+                self.set_error(format!("Cannot create file: {e}"));
+            }
+        }
+    }
+
+    fn run_import_sql_interactive(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ) -> io::Result<()> {
+        let path = match self.pending_import_path.take() {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let conn = match &self.rds_connection {
+            Some(c) => c,
+            None => {
+                self.set_error("Not connected".to_string());
+                return Ok(());
+            }
+        };
+
+        let expanded = if path.starts_with('~') {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            path.replacen('~', &home, 1)
+        } else {
+            path.clone()
+        };
+
+        if !std::path::Path::new(&expanded).exists() {
+            self.set_error(format!("File not found: {path}"));
+            return Ok(());
+        }
+
+        let mut mysql_cmd = format!(
+            "mysql -h {} -P {} -u {} --password='{}' ",
+            conn.host, conn.port, conn.user, conn.password
+        );
+        if let Some(ref db) = conn.database {
+            mysql_cmd.push_str(db);
+            mysql_cmd.push(' ');
+        }
+        mysql_cmd.push_str(&format!("< '{expanded}'"));
+
+        log::info!("import SQL: mysql ... < {expanded}");
+
+        // Suspend TUI
+        crossterm::terminal::disable_raw_mode()?;
+        crossterm::execute!(
+            terminal.backend_mut(),
+            crossterm::event::DisableMouseCapture,
+            crossterm::terminal::LeaveAlternateScreen
+        )?;
+
+        println!("Importing {path}...\n");
+
+        let status = std::process::Command::new("sh")
+            .args(["-c", &mysql_cmd])
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status();
+
+        match status {
+            Ok(s) if s.success() => {
+                println!("\nImport completed successfully.");
+            }
+            Ok(s) => {
+                println!("\nImport failed (exit {:?})", s.code());
+                self.set_error(format!("Import failed (exit {:?})", s.code()));
+            }
+            Err(e) => {
+                println!("\nImport error: {e}");
+                self.set_error(format!("Import error: {e}"));
+            }
+        }
+
+        println!("\nPress Enter to return to lazy-aws...");
+        let _ = std::io::stdin().read_line(&mut String::new());
+
+        // Resume TUI
+        crossterm::terminal::enable_raw_mode()?;
+        crossterm::execute!(
+            terminal.backend_mut(),
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::event::EnableMouseCapture
+        )?;
+        terminal.clear()?;
+
+        // Reload tables after import
+        self.spawn_load_rds_tables();
+
+        Ok(())
     }
 
     fn add_to_query_history(&mut self, query: &str) {

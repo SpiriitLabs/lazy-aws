@@ -305,6 +305,14 @@ fn help_sections() -> Vec<HelpSection> {
                     key: "enter".to_string(),
                     desc: "SELECT * from selected table".to_string(),
                 },
+                Hint {
+                    key: "e".to_string(),
+                    desc: "export query results to CSV".to_string(),
+                },
+                Hint {
+                    key: "i".to_string(),
+                    desc: "import SQL file".to_string(),
+                },
             ],
         },
         HelpSection {
