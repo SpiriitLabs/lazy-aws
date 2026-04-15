@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo fmt:*)",
+      "Bash(cargo clippy:*)",
+      "Read(//home/romain/.config/lazy-aws/**)"
+    ]
+  }
+}

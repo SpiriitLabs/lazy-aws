@@ -1,5 +1,6 @@
 pub mod app;
 pub mod components;
+pub mod fuzzy;
 pub mod keys;
 pub mod layout;
 pub mod messages;

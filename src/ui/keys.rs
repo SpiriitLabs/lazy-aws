@@ -46,6 +46,11 @@ pub struct KeyMap {
     pub top: KeyBinding,
     pub bottom: KeyBinding,
     pub export: KeyBinding,
+    pub tab_s3: KeyBinding,
+    pub download: KeyBinding,
+    pub upload: KeyBinding,
+    pub delete_object: KeyBinding,
+    pub sort: KeyBinding,
 }
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -208,6 +213,31 @@ pub fn default_key_map() -> KeyMap {
             help_key: "S".to_string(),
             help_desc: "export logs".to_string(),
         },
+        tab_s3: KeyBinding {
+            keys: vec![key(KeyCode::Char('6'))],
+            help_key: "6".to_string(),
+            help_desc: "S3".to_string(),
+        },
+        download: KeyBinding {
+            keys: vec![key(KeyCode::Char('d'))],
+            help_key: "d".to_string(),
+            help_desc: "download".to_string(),
+        },
+        upload: KeyBinding {
+            keys: vec![key(KeyCode::Char('u'))],
+            help_key: "u".to_string(),
+            help_desc: "upload".to_string(),
+        },
+        delete_object: KeyBinding {
+            keys: vec![key(KeyCode::Char('x'))],
+            help_key: "x".to_string(),
+            help_desc: "delete object".to_string(),
+        },
+        sort: KeyBinding {
+            keys: vec![key(KeyCode::Char('s'))],
+            help_key: "s".to_string(),
+            help_desc: "cycle sort".to_string(),
+        },
     }
 }
 
@@ -249,6 +279,11 @@ mod tests {
             ("Top", &km.top),
             ("Bottom", &km.bottom),
             ("Export", &km.export),
+            ("TabS3", &km.tab_s3),
+            ("Download", &km.download),
+            ("Upload", &km.upload),
+            ("DeleteObject", &km.delete_object),
+            ("Sort", &km.sort),
         ];
 
         for (name, binding) in bindings {

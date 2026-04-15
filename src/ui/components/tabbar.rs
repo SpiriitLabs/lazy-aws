@@ -4,7 +4,7 @@ use ratatui::style::{Modifier, Style};
 
 use crate::ui::style::theme;
 
-const TAB_LABELS: &[&str] = &["1:ECS", "2:Tasks", "3:SSM", "4:Logs", "5:RDS"];
+const TAB_LABELS: &[&str] = &["1:ECS", "2:Tasks", "3:SSM", "4:Logs", "5:RDS", "6:S3"];
 
 /// Height of the tab bar.
 pub const TAB_BAR_H: u16 = 1;
@@ -83,6 +83,7 @@ mod tests {
         assert!(view.contains(" 3:SSM "));
         assert!(view.contains(" 4:Logs "));
         assert!(view.contains(" 5:RDS "));
+        assert!(view.contains(" 6:S3 "));
     }
 
     #[test]

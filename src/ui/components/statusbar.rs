@@ -180,6 +180,29 @@ pub fn default_hints(tab: usize) -> Vec<Hint> {
                 desc: "import SQL".to_string(),
             });
         }
+        5 => {
+            // S3
+            hints.push(Hint {
+                key: "enter".to_string(),
+                desc: "browse".to_string(),
+            });
+            hints.push(Hint {
+                key: "d".to_string(),
+                desc: "download".to_string(),
+            });
+            hints.push(Hint {
+                key: "u".to_string(),
+                desc: "upload".to_string(),
+            });
+            hints.push(Hint {
+                key: "x".to_string(),
+                desc: "delete".to_string(),
+            });
+            hints.push(Hint {
+                key: "s".to_string(),
+                desc: "sort".to_string(),
+            });
+        }
         _ => {}
     }
 
