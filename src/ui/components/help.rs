@@ -294,6 +294,10 @@ fn help_sections() -> Vec<HelpSection> {
                     desc: "run SQL query".to_string(),
                 },
                 Hint {
+                    key: "e".to_string(),
+                    desc: "execute modify query (INSERT/UPDATE/DELETE/DDL)".to_string(),
+                },
+                Hint {
                     key: "d".to_string(),
                     desc: "disconnect".to_string(),
                 },
@@ -306,7 +310,7 @@ fn help_sections() -> Vec<HelpSection> {
                     desc: "SELECT * from selected table".to_string(),
                 },
                 Hint {
-                    key: "e".to_string(),
+                    key: "E".to_string(),
                     desc: "export query results to CSV".to_string(),
                 },
                 Hint {
