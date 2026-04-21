@@ -51,6 +51,9 @@ pub struct KeyMap {
     pub upload: KeyBinding,
     pub delete_object: KeyBinding,
     pub sort: KeyBinding,
+    pub sql_modify: KeyBinding,
+    pub resize_mode: KeyBinding,
+    pub layout_toggle: KeyBinding,
 }
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -109,7 +112,11 @@ pub fn default_key_map() -> KeyMap {
             help_desc: "next panel".to_string(),
         },
         prev_tab: KeyBinding {
-            keys: vec![key(KeyCode::BackTab)],
+            keys: vec![
+                key(KeyCode::BackTab),
+                key_shift(KeyCode::BackTab),
+                key_shift(KeyCode::Tab),
+            ],
             help_key: "shift+tab".to_string(),
             help_desc: "prev panel".to_string(),
         },
@@ -238,6 +245,21 @@ pub fn default_key_map() -> KeyMap {
             help_key: "s".to_string(),
             help_desc: "cycle sort".to_string(),
         },
+        sql_modify: KeyBinding {
+            keys: vec![key(KeyCode::Char('e'))],
+            help_key: "e".to_string(),
+            help_desc: "execute modify".to_string(),
+        },
+        resize_mode: KeyBinding {
+            keys: vec![key_ctrl(KeyCode::Char('r'))],
+            help_key: "Ctrl+r".to_string(),
+            help_desc: "resize mode".to_string(),
+        },
+        layout_toggle: KeyBinding {
+            keys: vec![key_ctrl(KeyCode::Char('v'))],
+            help_key: "Ctrl+v".to_string(),
+            help_desc: "toggle layout".to_string(),
+        },
     }
 }
 
@@ -284,6 +306,9 @@ mod tests {
             ("Upload", &km.upload),
             ("DeleteObject", &km.delete_object),
             ("Sort", &km.sort),
+            ("SqlModify", &km.sql_modify),
+            ("ResizeMode", &km.resize_mode),
+            ("LayoutToggle", &km.layout_toggle),
         ];
 
         for (name, binding) in bindings {

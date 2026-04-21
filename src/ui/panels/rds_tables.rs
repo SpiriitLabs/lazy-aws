@@ -109,23 +109,22 @@ impl RdsTablesPanel {
         block.render(area, buf);
 
         let items = self.visible();
+        let max_w = inner.width.saturating_sub(2) as usize;
         if loading {
             let style = Style::default().fg(theme::color_primary());
-            buf.set_string(inner.x + 1, inner.y, "Loading...", style);
+            let msg: String = "Loading...".chars().take(max_w).collect();
+            buf.set_string(inner.x + 1, inner.y, &msg, style);
             return;
         }
         if items.is_empty() {
             let style = Style::default().fg(theme::color_muted());
-            buf.set_string(
-                inner.x + 1,
-                inner.y,
-                if self.tables.is_empty() {
-                    "Connect first (c)"
-                } else {
-                    "No match"
-                },
-                style,
-            );
+            let raw = if self.tables.is_empty() {
+                "Connect first (c)"
+            } else {
+                "No match"
+            };
+            let msg: String = raw.chars().take(max_w).collect();
+            buf.set_string(inner.x + 1, inner.y, &msg, style);
             return;
         }
 
@@ -155,7 +154,9 @@ impl RdsTablesPanel {
                 Style::default().fg(theme::color_text())
             };
 
-            buf.set_string(inner.x + 1, y, format!(" {table}"), style);
+            let line = format!(" {table}");
+            let truncated: String = line.chars().take(max_w).collect();
+            buf.set_string(inner.x + 1, y, &truncated, style);
         }
     }
 }

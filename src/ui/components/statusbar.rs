@@ -62,20 +62,36 @@ impl StatusBar {
             buf.set_string(x, area.y, " ", bg);
         }
 
+        // Reserve space on the right for aws_info so hints don't overwrite it.
+        let info_len = self.aws_info.len() as u16;
+        let reserve_right = if !self.aws_info.is_empty() && area.width > info_len + 2 {
+            info_len + 2 // info + 1 margin on each side
+        } else {
+            0
+        };
+        let right_limit = area.x + area.width.saturating_sub(reserve_right);
+
         let mut x = area.x + 1;
 
         // Loading message
         if !self.loading_msg.is_empty() {
             let msg = format!("⟳ {}", self.loading_msg);
-            let style = Style::default()
-                .fg(Color::Rgb(0x00, 0x00, 0x00))
-                .bg(theme::color_warning());
-            buf.set_string(x, area.y, &msg, style);
-            x += msg.len() as u16 + 2;
+            let needed = msg.len() as u16;
+            if x + needed <= right_limit {
+                let style = Style::default()
+                    .fg(Color::Rgb(0x00, 0x00, 0x00))
+                    .bg(theme::color_warning());
+                buf.set_string(x, area.y, &msg, style);
+                x += needed + 2;
+            }
         }
 
-        // Hints
+        // Hints — skip any that would overflow past right_limit.
         for hint in &self.hints {
+            let needed = hint.key.len() as u16 + 1 + hint.desc.len() as u16 + 2;
+            if x + needed > right_limit {
+                break;
+            }
             let key_style = Style::default().fg(theme::color_primary()).bg(bar_bg);
             buf.set_string(x, area.y, &hint.key, key_style);
             x += hint.key.len() as u16 + 1;
@@ -84,13 +100,10 @@ impl StatusBar {
         }
 
         // AWS info on the right
-        if !self.aws_info.is_empty() {
-            let info_len = self.aws_info.len() as u16;
-            if area.width > info_len + 2 {
-                let info_x = area.x + area.width - info_len - 1;
-                let info_style = Style::default().fg(theme::color_primary()).bg(bar_bg);
-                buf.set_string(info_x, area.y, &self.aws_info, info_style);
-            }
+        if reserve_right > 0 {
+            let info_x = area.x + area.width - info_len - 1;
+            let info_style = Style::default().fg(theme::color_primary()).bg(bar_bg);
+            buf.set_string(info_x, area.y, &self.aws_info, info_style);
         }
     }
 }

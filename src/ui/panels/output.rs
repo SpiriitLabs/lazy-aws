@@ -43,13 +43,15 @@ impl OutputPanel {
             0
         };
 
+        let max_w = inner.width.saturating_sub(2) as usize;
         for (i, line) in self.lines.iter().skip(offset).enumerate() {
             if i >= visible {
                 break;
             }
             let y = inner.y + i as u16;
             let style = Style::default().fg(theme::color_text());
-            buf.set_string(inner.x + 1, y, line, style);
+            let truncated: String = line.chars().take(max_w).collect();
+            buf.set_string(inner.x + 1, y, &truncated, style);
         }
     }
 }

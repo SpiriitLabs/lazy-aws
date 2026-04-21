@@ -64,9 +64,13 @@ impl DetailPanel {
         let inner = block.inner(area);
         block.render(area, buf);
 
+        // Keep one column of right padding so text never hits the right border.
+        let max_w = inner.width.saturating_sub(2) as usize;
+
         if self.lines.is_empty() {
             let style = Style::default().fg(theme::color_muted());
-            buf.set_string(inner.x + 1, inner.y, "Select an item", style);
+            let placeholder: String = "Select an item".chars().take(max_w).collect();
+            buf.set_string(inner.x + 1, inner.y, &placeholder, style);
             return;
         }
 
@@ -79,7 +83,8 @@ impl DetailPanel {
             }
             let y = inner.y + i as u16;
             let style = Style::default().fg(theme::color_text());
-            buf.set_string(inner.x + 1, y, line, style);
+            let truncated: String = line.chars().take(max_w).collect();
+            buf.set_string(inner.x + 1, y, &truncated, style);
         }
 
         // Scroll indicators

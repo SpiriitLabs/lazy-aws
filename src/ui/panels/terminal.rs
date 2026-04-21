@@ -41,12 +41,12 @@ impl TerminalPanel {
 
         if !self.active {
             let style = Style::default().fg(theme::color_muted());
-            buf.set_string(
-                inner.x + 1,
-                inner.y,
-                "Press 'e' to exec into a container",
-                style,
-            );
+            let max_w = inner.width.saturating_sub(2) as usize;
+            let msg: String = "Press 'e' to exec into a container"
+                .chars()
+                .take(max_w)
+                .collect();
+            buf.set_string(inner.x + 1, inner.y, &msg, style);
         }
     }
 }

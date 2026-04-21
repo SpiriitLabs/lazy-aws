@@ -18,7 +18,7 @@ use crate::aws::{self, Runner, StreamLine};
 use crate::credentials;
 use crate::ui::components::*;
 use crate::ui::keys::default_key_map;
-use crate::ui::layout::compute_layout;
+use crate::ui::layout::{compute_layout, LayoutMode};
 use crate::ui::messages::Action;
 use crate::ui::panels;
 use crate::ui::style::{styles, theme};
@@ -105,6 +105,13 @@ enum ChoiceMode {
     RdsConnectMethod,
     SqlHistory,
     SsmInstanceSelector,
+}
+
+#[derive(Default, PartialEq, Eq, Clone, Copy)]
+enum ResizeMode {
+    #[default]
+    Inactive,
+    Active,
 }
 
 #[derive(PartialEq)]
@@ -320,6 +327,10 @@ pub struct App {
     hit_top_panel: Rect,
     hit_bottom_panel: Rect,
     hit_right_panel: Rect,
+
+    // Layout adaptation
+    layout_mode_override: Option<LayoutMode>,
+    resize_mode: ResizeMode,
 }
 
 impl App {
@@ -423,6 +434,8 @@ impl App {
             hit_top_panel: Rect::default(),
             hit_bottom_panel: Rect::default(),
             hit_right_panel: Rect::default(),
+            layout_mode_override: None,
+            resize_mode: ResizeMode::Inactive,
         }
     }
 
@@ -496,7 +509,7 @@ impl App {
                         self.handle_mouse(mouse);
                     }
                     Event::Resize(w, h) => {
-                        self.layout = compute_layout(w, h);
+                        self.layout = compute_layout(w, h, self.layout_mode_override);
                     }
                     _ => {}
                 }
@@ -956,7 +969,53 @@ impl App {
             return false;
         }
 
-        // 6. Global keys
+        // 6. Resize mode — exclusive: arrows adjust splits, Esc/toggle exits.
+        //    Only meaningful in horizontal layout; in vertical mode the toggle is a no-op.
+        if km.resize_mode.matches(&key) {
+            if self.layout.mode == LayoutMode::Horizontal {
+                self.resize_mode = match self.resize_mode {
+                    ResizeMode::Inactive => ResizeMode::Active,
+                    ResizeMode::Active => ResizeMode::Inactive,
+                };
+            } else {
+                self.info = Some("Resize disabled in vertical layout".to_string());
+                self.msg_time = Some(std::time::Instant::now());
+            }
+            return false;
+        }
+        if self.resize_mode == ResizeMode::Active {
+            match key.code {
+                KeyCode::Left => {
+                    self.split_horizontal = self.split_horizontal.saturating_sub(2).max(20);
+                }
+                KeyCode::Right => {
+                    self.split_horizontal = (self.split_horizontal + 2).min(80);
+                }
+                KeyCode::Up => {
+                    self.split_vertical = self.split_vertical.saturating_sub(2).max(20);
+                }
+                KeyCode::Down => {
+                    self.split_vertical = (self.split_vertical + 2).min(80);
+                }
+                KeyCode::Esc => {
+                    self.resize_mode = ResizeMode::Inactive;
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        // 7. Layout toggle (auto ↔ force-horizontal ↔ force-vertical).
+        if km.layout_toggle.matches(&key) {
+            self.layout_mode_override = match self.layout_mode_override {
+                None => Some(LayoutMode::Horizontal),
+                Some(LayoutMode::Horizontal) => Some(LayoutMode::Vertical),
+                Some(LayoutMode::Vertical) => None,
+            };
+            return false;
+        }
+
+        // 8. Global keys
         if km.quit.matches(&key) {
             return true;
         }
@@ -997,18 +1056,12 @@ impl App {
 
         // Panel switching within tab
         if km.next_tab.matches(&key) {
-            let max_panels = match self.active_tab {
-                TAB_LOGS | TAB_RDS => 3,
-                _ => 2,
-            };
+            let max_panels = self.max_panels();
             self.active_panel = (self.active_panel + 1) % max_panels;
             return false;
         }
         if km.prev_tab.matches(&key) {
-            let max_panels = match self.active_tab {
-                TAB_LOGS | TAB_RDS => 3,
-                _ => 2,
-            };
+            let max_panels = self.max_panels();
             self.active_panel = if self.active_panel == 0 {
                 max_panels - 1
             } else {
@@ -1110,27 +1163,6 @@ impl App {
                 }
                 _ => {}
             }
-        }
-
-        // Panel resize
-        match key.code {
-            KeyCode::Char('>') | KeyCode::Char('.') => {
-                self.split_horizontal = (self.split_horizontal + 5).min(80);
-                return false;
-            }
-            KeyCode::Char('<') | KeyCode::Char(',') => {
-                self.split_horizontal = self.split_horizontal.saturating_sub(5).max(20);
-                return false;
-            }
-            KeyCode::Char('+') | KeyCode::Char('=') => {
-                self.split_vertical = (self.split_vertical + 5).min(80);
-                return false;
-            }
-            KeyCode::Char('-') => {
-                self.split_vertical = self.split_vertical.saturating_sub(5).max(20);
-                return false;
-            }
-            _ => {}
         }
 
         // Navigation
@@ -1882,7 +1914,7 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 // Tab bar click
                 if row == 0 {
-                    if let Some(tab) = tab_index_at(col) {
+                    if let Some(tab) = tab_index_at(col, self.hit_tab_bar.width) {
                         self.switch_tab(tab);
                     }
                     return;
@@ -1894,7 +1926,9 @@ impl App {
                 } else if self.is_in_rect(col, row, self.hit_bottom_panel) {
                     self.active_panel = 1;
                 } else if self.is_in_rect(col, row, self.hit_right_panel)
-                    && (self.active_tab == TAB_LOGS || self.active_tab == TAB_RDS)
+                    && (self.layout.mode == LayoutMode::Vertical
+                        || self.active_tab == TAB_LOGS
+                        || self.active_tab == TAB_RDS)
                 {
                     self.active_panel = 2;
                 }
@@ -1907,7 +1941,9 @@ impl App {
                     self.active_panel = 1;
                     self.navigate_up();
                 } else if self.is_in_rect(col, row, self.hit_right_panel)
-                    && (self.active_tab == TAB_LOGS || self.active_tab == TAB_RDS)
+                    && (self.layout.mode == LayoutMode::Vertical
+                        || self.active_tab == TAB_LOGS
+                        || self.active_tab == TAB_RDS)
                 {
                     self.active_panel = 2;
                     self.navigate_up();
@@ -1921,7 +1957,9 @@ impl App {
                     self.active_panel = 1;
                     self.navigate_down();
                 } else if self.is_in_rect(col, row, self.hit_right_panel)
-                    && (self.active_tab == TAB_LOGS || self.active_tab == TAB_RDS)
+                    && (self.layout.mode == LayoutMode::Vertical
+                        || self.active_tab == TAB_LOGS
+                        || self.active_tab == TAB_RDS)
                 {
                     self.active_panel = 2;
                     self.navigate_down();
@@ -1935,9 +1973,36 @@ impl App {
         col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
     }
 
+    /// Recolor the 1-cell-thick border of `area` without touching its interior.
+    fn recolor_border(buf: &mut ratatui::buffer::Buffer, area: Rect, color: ratatui::style::Color) {
+        if area.width < 2 || area.height < 2 {
+            return;
+        }
+        let x0 = area.x;
+        let y0 = area.y;
+        let x1 = area.x + area.width - 1;
+        let y1 = area.y + area.height - 1;
+        for x in x0..=x1 {
+            if let Some(cell) = buf.cell_mut((x, y0)) {
+                cell.set_fg(color);
+            }
+            if let Some(cell) = buf.cell_mut((x, y1)) {
+                cell.set_fg(color);
+            }
+        }
+        for y in y0..=y1 {
+            if let Some(cell) = buf.cell_mut((x0, y)) {
+                cell.set_fg(color);
+            }
+            if let Some(cell) = buf.cell_mut((x1, y)) {
+                cell.set_fg(color);
+            }
+        }
+    }
+
     fn render(&mut self, f: &mut ratatui::Frame) {
         let size = f.area();
-        self.layout = compute_layout(size.width, size.height);
+        self.layout = compute_layout(size.width, size.height, self.layout_mode_override);
 
         // Layout: tab bar (1 line) + content + status bar (1 line)
         let chunks = Layout::default()
@@ -1957,6 +2022,25 @@ impl App {
 
         // Tab bar
         render_tab_bar(self.active_tab, tab_area, f.buffer_mut());
+
+        // Clamp active_panel in case the allowed range changed (layout toggled).
+        let max_panels = self.max_panels();
+        if self.active_panel >= max_panels {
+            self.active_panel = max_panels.saturating_sub(1);
+        }
+
+        // Vertical layout: all panels stacked with the active one taking the remaining
+        // space and the others collapsed to their title bar (lazygit portrait style).
+        if self.layout.mode == LayoutMode::Vertical {
+            let rects = self.vertical_panel_rects(content_area);
+            self.hit_top_panel = *rects.first().unwrap_or(&Rect::default());
+            self.hit_bottom_panel = *rects.get(1).unwrap_or(&Rect::default());
+            self.hit_right_panel = *rects.get(2).unwrap_or(&Rect::default());
+            self.render_vertical_content(content_area, f.buffer_mut());
+            self.render_status_bar(status_area, f.buffer_mut());
+            self.render_overlays(size, f);
+            return;
+        }
 
         // Content: left (50%) + right (50%)
         let h_ratio = if self.active_tab == TAB_LOGS || self.active_tab == TAB_RDS {
@@ -2158,10 +2242,203 @@ impl App {
             _ => {}
         }
 
-        // Status bar
+        // Overlay: recolor borders when resize mode is active (horizontal layout only).
+        if self.resize_mode == ResizeMode::Active {
+            let accent = theme::color_primary();
+            Self::recolor_border(f.buffer_mut(), top_panel_area, accent);
+            Self::recolor_border(f.buffer_mut(), bottom_panel_area, accent);
+            Self::recolor_border(f.buffer_mut(), right_area, accent);
+        }
+
+        self.render_status_bar(status_area, f.buffer_mut());
+        self.render_overlays(size, f);
+    }
+
+    /// Number of tab-cyclable panels for the current tab in the current layout mode.
+    fn max_panels(&self) -> usize {
+        if self.layout.mode == LayoutMode::Vertical {
+            match self.active_tab {
+                TAB_SSM => 2, // Instances + Detail (skip empty Sessions block)
+                _ => 3,       // top + bottom + detail/right
+            }
+        } else {
+            match self.active_tab {
+                TAB_LOGS | TAB_RDS => 3,
+                _ => 2,
+            }
+        }
+    }
+
+    /// Compute stacked rects for the current tab's panels (lazygit-style).
+    /// The active panel takes remaining space; inactives collapse to `COLLAPSED_PANEL_H` rows.
+    fn vertical_panel_rects(&self, area: Rect) -> Vec<Rect> {
+        let count = self.max_panels();
+        let constraints: Vec<Constraint> = (0..count)
+            .map(|i| {
+                if i == self.active_panel {
+                    Constraint::Fill(1)
+                } else {
+                    Constraint::Length(crate::ui::layout::COLLAPSED_PANEL_H)
+                }
+            })
+            .collect();
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
+            .split(area)
+            .to_vec()
+    }
+
+    /// Render all panels of the current tab stacked vertically (lazygit portrait style).
+    fn render_vertical_content(&mut self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
+        let rects = self.vertical_panel_rects(area);
+        let active = self.active_panel;
+
+        match self.active_tab {
+            TAB_ECS => {
+                self.clusters
+                    .render(rects[0], buf, active == 0, self.loading_clusters);
+                self.services
+                    .render(rects[1], buf, active == 1, self.loading_services);
+                if active == 1 {
+                    if let Some(svc) = self.services.selected() {
+                        self.detail.set_lines(format_service_detail(svc));
+                    }
+                } else if let Some(cluster) = self.clusters.selected() {
+                    self.detail.set_lines(format_cluster_detail(cluster));
+                }
+                self.detail.render(rects[2], buf, active == 2);
+            }
+            TAB_TASKS => {
+                self.tasks
+                    .render(rects[0], buf, active == 0, self.loading_tasks);
+                self.containers.render(rects[1], buf, active == 1, false);
+                if self.terminal.is_active() {
+                    self.terminal.render(rects[2], buf);
+                } else {
+                    if active == 1 {
+                        if let Some(container) = self.containers.selected() {
+                            self.detail.set_lines(format_container_detail(container));
+                        }
+                    } else if let Some(task) = self.tasks.selected() {
+                        self.detail.set_lines(format_task_detail(task));
+                    }
+                    self.detail.render(rects[2], buf, active == 2);
+                }
+            }
+            TAB_SSM => {
+                self.instances
+                    .render(rects[0], buf, active == 0, self.loading_instances);
+                if let Some(inst) = self.instances.selected() {
+                    self.detail.set_lines(format_instance_detail(inst));
+                }
+                self.detail.render(rects[1], buf, active == 1);
+            }
+            TAB_LOGS => {
+                self.log_groups
+                    .render(rects[0], buf, active == 0, self.loading_log_groups);
+                self.log_streams
+                    .render(rects[1], buf, active == 1, self.loading_log_streams);
+                // Third slot: log viewer. When active, split it into viewer + detail.
+                if active == 2 && rects[2].height > crate::ui::layout::COLLAPSED_PANEL_H * 2 {
+                    let inner = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Percentage(self.split_vertical),
+                            Constraint::Percentage(100 - self.split_vertical),
+                        ])
+                        .split(rects[2]);
+                    self.log_viewer.render(inner[0], buf, true);
+                    let selected_log = self.log_viewer.selected_line().unwrap_or("").to_string();
+                    panels::render_log_detail(&selected_log, inner[1], buf, true);
+                } else {
+                    self.log_viewer.render(rects[2], buf, active == 2);
+                }
+            }
+            TAB_RDS => {
+                self.rds_instances
+                    .render(rects[0], buf, active == 0, self.loading_rds_instances);
+                self.rds_tables
+                    .render(rects[1], buf, active == 1, self.loading_rds_tables);
+                if self.rds_connection.is_some() {
+                    self.query_results
+                        .render(rects[2], buf, active == 2, self.loading_query);
+                } else {
+                    if let Some(inst) = self.rds_instances.selected() {
+                        self.detail.set_lines(format_rds_instance_detail(inst));
+                    }
+                    self.detail.render(rects[2], buf, active == 2);
+                }
+            }
+            TAB_S3 => {
+                self.buckets
+                    .render(rects[0], buf, active == 0, self.loading_buckets);
+                self.objects
+                    .render(rects[1], buf, active == 1, self.loading_objects);
+                if active == 1 {
+                    match self.objects.selected() {
+                        Some(panels::S3ObjectItem::Object(obj)) => {
+                            let bucket = self.selected_bucket.as_deref().unwrap_or("?").to_string();
+                            self.detail.set_lines(format_object_detail(obj, &bucket));
+                        }
+                        Some(panels::S3ObjectItem::Prefix(p)) => {
+                            let bucket = self.selected_bucket.as_deref().unwrap_or("?").to_string();
+                            self.detail.set_lines(vec![
+                                format!("Prefix: {p}"),
+                                String::new(),
+                                format!("URI: s3://{bucket}/{p}"),
+                            ]);
+                        }
+                        _ => {
+                            self.detail.clear();
+                        }
+                    }
+                } else if let Some(bucket) = self.buckets.selected() {
+                    self.detail.set_lines(format_bucket_detail(bucket));
+                }
+                self.detail.render(rects[2], buf, active == 2);
+            }
+            _ => {}
+        }
+
+        if self.resize_mode == ResizeMode::Active {
+            // Recolor only the active panel's border (no splits to resize in vertical mode).
+            Self::recolor_border(buf, rects[active], theme::color_primary());
+        }
+    }
+
+    fn render_status_bar(&self, status_area: Rect, buf: &mut ratatui::buffer::Buffer) {
         let mut sb = StatusBar::new();
         sb.set_width(status_area.width);
-        sb.set_hints(default_hints(self.active_tab));
+        let hints = if self.resize_mode == ResizeMode::Active {
+            vec![
+                Hint {
+                    key: "←→".to_string(),
+                    desc: "h-split".to_string(),
+                },
+                Hint {
+                    key: "↑↓".to_string(),
+                    desc: "v-split".to_string(),
+                },
+                Hint {
+                    key: "Esc".to_string(),
+                    desc: "done".to_string(),
+                },
+            ]
+        } else if self.layout.mode == LayoutMode::Vertical {
+            let mut h = default_hints(self.active_tab);
+            h.insert(
+                0,
+                Hint {
+                    key: format!("{}/{}", self.active_panel + 1, self.max_panels()),
+                    desc: "panel".to_string(),
+                },
+            );
+            h
+        } else {
+            default_hints(self.active_tab)
+        };
+        sb.set_hints(hints);
 
         // AWS info on the right
         let profile_name = self.active_profile.as_deref().unwrap_or("no profile");
@@ -2176,7 +2453,7 @@ impl App {
             sb.set_loading(&self.spinner.view());
         }
 
-        sb.render(status_area, f.buffer_mut());
+        sb.render(status_area, buf);
 
         // Status messages overlay
         if let Some(ref info) = self.info {
@@ -2184,16 +2461,17 @@ impl App {
             let style = styles::success_style();
             let x = status_area.x + 1;
             let y = status_area.y;
-            f.buffer_mut().set_string(x, y, &info_text, style);
+            buf.set_string(x, y, &info_text, style);
         } else if let Some(ref err) = self.err {
             let err_text = format!(" Error: {err} ");
             let style = styles::error_style();
             let x = status_area.x + 1;
             let y = status_area.y;
-            f.buffer_mut().set_string(x, y, &err_text, style);
+            buf.set_string(x, y, &err_text, style);
         }
+    }
 
-        // Overlays
+    fn render_overlays(&mut self, size: Rect, f: &mut ratatui::Frame) {
         if self.help.is_visible() {
             let popup_area = centered_rect(60, 80, size);
             self.help.render(popup_area, f.buffer_mut());
