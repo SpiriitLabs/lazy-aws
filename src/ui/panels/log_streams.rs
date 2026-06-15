@@ -56,7 +56,7 @@ impl LogStreamsPanel {
                     fuzzy_match(&s.log_stream_name, &self.filter).map(|sc| (i, sc))
                 })
                 .collect();
-            scored.sort_by(|a, b| b.1.cmp(&a.1));
+            scored.sort_by_key(|b| std::cmp::Reverse(b.1));
             self.filtered = scored.into_iter().map(|(i, _)| i).collect();
         }
         let count = self.filtered.len();

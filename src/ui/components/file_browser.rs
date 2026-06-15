@@ -123,7 +123,7 @@ impl FileBrowser {
                 .enumerate()
                 .filter_map(|(i, e)| fuzzy_match(&e.label, &self.filter).map(|s| (i, s)))
                 .collect();
-            scored.sort_by(|a, b| b.1.cmp(&a.1));
+            scored.sort_by_key(|b| std::cmp::Reverse(b.1));
             self.filtered = scored.into_iter().map(|(i, _)| i).collect();
         }
         if self.cursor >= self.filtered.len() {
@@ -298,8 +298,8 @@ fn build_entries(dir: &Path, mode: BrowserMode) -> Vec<Entry> {
             }
         }
     }
-    dirs.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
-    files.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+    dirs.sort_by_key(|e| e.label.to_lowercase());
+    files.sort_by_key(|e| e.label.to_lowercase());
     out.extend(dirs);
     out.extend(files);
     out

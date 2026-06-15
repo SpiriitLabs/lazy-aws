@@ -55,7 +55,7 @@ impl ClustersPanel {
                 .enumerate()
                 .filter_map(|(i, c)| fuzzy_match(&c.cluster_name, &self.filter).map(|s| (i, s)))
                 .collect();
-            scored.sort_by(|a, b| b.1.cmp(&a.1));
+            scored.sort_by_key(|b| std::cmp::Reverse(b.1));
             self.filtered = scored.into_iter().map(|(i, _)| i).collect();
         }
         let count = self.filtered.len();

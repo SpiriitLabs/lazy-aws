@@ -90,7 +90,7 @@ impl BucketsPanel {
                 .filter_map(|(i, b)| fuzzy_match(&b.name, &self.filter).map(|s| (i, s)))
                 .collect();
             // Sort by fuzzy score descending, then by sort_by as tiebreaker
-            scored.sort_by(|a, b| b.1.cmp(&a.1));
+            scored.sort_by_key(|b| std::cmp::Reverse(b.1));
             let scores: Vec<i32> = scored.iter().map(|s| s.1).collect();
             self.filtered = scored.into_iter().map(|(i, _)| i).collect();
             self.sort_filtered(&scores);

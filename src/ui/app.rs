@@ -2546,17 +2546,13 @@ impl App {
                 }
             }
             // Native horizontal wheel (trackpads / tilt wheels).
-            MouseEventKind::ScrollLeft => {
-                if self.grid_under(col, row) {
-                    self.active_panel = 2;
-                    self.query_results.move_left();
-                }
+            MouseEventKind::ScrollLeft if self.grid_under(col, row) => {
+                self.active_panel = 2;
+                self.query_results.move_left();
             }
-            MouseEventKind::ScrollRight => {
-                if self.grid_under(col, row) {
-                    self.active_panel = 2;
-                    self.query_results.move_right();
-                }
+            MouseEventKind::ScrollRight if self.grid_under(col, row) => {
+                self.active_panel = 2;
+                self.query_results.move_right();
             }
             _ => {}
         }
