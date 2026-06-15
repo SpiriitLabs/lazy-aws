@@ -1,3 +1,29 @@
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::Style;
+
+use crate::ui::style::theme;
+
+/// Renders a placeholder line inside a panel's inner area.
+///
+/// Standardizes empty/loading states across every list panel: loading uses the
+/// primary color with a `◌` marker, empty/info states use muted gray. Always
+/// drawn at the same position so panels look consistent.
+pub fn render_placeholder(buf: &mut Buffer, inner: Rect, msg: &str, loading: bool) {
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let (style, text) = if loading {
+        (
+            Style::default().fg(theme::color_primary()),
+            format!("◌ {msg}"),
+        )
+    } else {
+        (Style::default().fg(theme::color_muted()), msg.to_string())
+    };
+    buf.set_string(inner.x + 1, inner.y, &text, style);
+}
+
 pub mod buckets;
 pub mod clusters;
 pub mod containers;

@@ -1,11 +1,11 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 
 use crate::aws::Task;
-use crate::ui::style::theme;
+use crate::ui::style::{styles, theme};
 
 pub struct TasksPanel {
     pub tasks: Vec<Task>,
@@ -121,8 +121,7 @@ impl TasksPanel {
 
         let items = self.visible();
         if loading {
-            let style = Style::default().fg(theme::color_primary());
-            buf.set_string(inner.x + 1, inner.y, "Loading...", style);
+            crate::ui::panels::render_placeholder(buf, inner, "Loading...", true);
             return;
         }
         if items.is_empty() {
@@ -163,14 +162,8 @@ impl TasksPanel {
             let status_color = theme::status_color(&task.last_status);
             let container_count = format!(" {} containers", task.containers.len());
 
-            let style = if is_selected && is_active {
-                Style::default()
-                    .fg(theme::color_bright())
-                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-            } else if is_selected {
-                Style::default()
-                    .fg(theme::color_text())
-                    .add_modifier(Modifier::REVERSED)
+            let style = if is_selected {
+                styles::selection_style(is_active)
             } else {
                 Style::default().fg(theme::color_text())
             };

@@ -1,12 +1,12 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 
 use crate::aws::{S3ListResult, S3Object};
 use crate::ui::fuzzy::fuzzy_match;
-use crate::ui::style::theme;
+use crate::ui::style::{styles, theme};
 
 /// An entry in the objects panel.
 #[derive(Debug, Clone)]
@@ -399,10 +399,8 @@ impl ObjectsPanel {
                 ),
             };
 
-            let base_style = if is_selected && is_active {
-                text_style.add_modifier(Modifier::BOLD | Modifier::REVERSED)
-            } else if is_selected {
-                text_style.add_modifier(Modifier::REVERSED)
+            let base_style = if is_selected {
+                styles::selection_style(is_active)
             } else {
                 text_style
             };

@@ -3,7 +3,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, Widget};
 
-use crate::ui::style::theme;
+use crate::ui::style::{styles, theme};
 
 pub struct QueryResultsPanel {
     pub columns: Vec<String>,
@@ -279,14 +279,8 @@ impl QueryResultsPanel {
             let y = data_start_y + i as u16;
             let is_selected = (i + offset) == self.cursor;
 
-            let row_style = if is_selected && is_active {
-                Style::default()
-                    .fg(theme::color_bright())
-                    .add_modifier(Modifier::REVERSED)
-            } else if is_selected {
-                Style::default()
-                    .fg(theme::color_text())
-                    .add_modifier(Modifier::REVERSED)
+            let row_style = if is_selected {
+                styles::selection_style(is_active)
             } else if (i + offset) % 2 == 1 {
                 Style::default().fg(theme::color_muted())
             } else {

@@ -265,12 +265,16 @@ fn help_sections() -> Vec<HelpSection> {
                     desc: "Insights query".to_string(),
                 },
                 Hint {
-                    key: "h/l / ←→".to_string(),
-                    desc: "scroll logs left/right".to_string(),
+                    key: "/".to_string(),
+                    desc: "filter logs (follow continues)".to_string(),
                 },
                 Hint {
-                    key: "w".to_string(),
-                    desc: "toggle word wrap".to_string(),
+                    key: "t".to_string(),
+                    desc: "toggle timestamp column".to_string(),
+                },
+                Hint {
+                    key: "g/G".to_string(),
+                    desc: "jump to top/bottom".to_string(),
                 },
                 Hint {
                     key: "S".to_string(),

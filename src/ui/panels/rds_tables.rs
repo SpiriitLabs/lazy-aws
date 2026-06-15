@@ -1,9 +1,9 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, Widget};
 
-use crate::ui::style::theme;
+use crate::ui::style::{styles, theme};
 
 pub struct RdsTablesPanel {
     pub tables: Vec<String>,
@@ -111,9 +111,7 @@ impl RdsTablesPanel {
         let items = self.visible();
         let max_w = inner.width.saturating_sub(2) as usize;
         if loading {
-            let style = Style::default().fg(theme::color_primary());
-            let msg: String = "Loading...".chars().take(max_w).collect();
-            buf.set_string(inner.x + 1, inner.y, &msg, style);
+            crate::ui::panels::render_placeholder(buf, inner, "Loading...", true);
             return;
         }
         if items.is_empty() {
@@ -142,14 +140,8 @@ impl RdsTablesPanel {
             let y = inner.y + i as u16;
             let is_selected = (i + offset) == self.cursor;
 
-            let style = if is_selected && is_active {
-                Style::default()
-                    .fg(theme::color_bright())
-                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-            } else if is_selected {
-                Style::default()
-                    .fg(theme::color_text())
-                    .add_modifier(Modifier::REVERSED)
+            let style = if is_selected {
+                styles::selection_style(is_active)
             } else {
                 Style::default().fg(theme::color_text())
             };

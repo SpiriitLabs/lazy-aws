@@ -21,7 +21,10 @@ fn labels_for(width: u16) -> &'static [&'static str] {
 }
 
 /// Renders the tab bar at the given area.
-pub fn render_tab_bar(active: usize, area: Rect, buf: &mut Buffer) {
+///
+/// `breadcrumb` is the current navigation context (e.g. "cluster › service"),
+/// rendered right-aligned when there is room left after the tabs.
+pub fn render_tab_bar(active: usize, breadcrumb: &str, area: Rect, buf: &mut Buffer) {
     let bg = Style::default().fg(theme::color_muted());
     for x in area.x..area.x + area.width {
         buf.set_string(x, area.y, " ", bg);
@@ -56,6 +59,19 @@ pub fn render_tab_bar(active: usize, area: Rect, buf: &mut Buffer) {
             x += 1;
         }
         x += 1;
+    }
+
+    // Breadcrumb (current context), right-aligned if it fits without
+    // overlapping the tabs.
+    if !breadcrumb.is_empty() {
+        let bc_len = breadcrumb.chars().count() as u16;
+        if right_limit > bc_len + 1 {
+            let bc_x = right_limit - bc_len - 1;
+            if bc_x > x {
+                let style = Style::default().fg(theme::color_text());
+                buf.set_string(bc_x, area.y, breadcrumb, style);
+            }
+        }
     }
 }
 

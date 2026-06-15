@@ -257,12 +257,8 @@ impl LogViewerPanel {
         };
 
         let normal_style = Style::default().fg(theme::color_text());
-        let selected_style = Style::default()
-            .fg(theme::color_bright())
-            .add_modifier(Modifier::BOLD | Modifier::REVERSED);
-        let selected_inactive = Style::default()
-            .fg(theme::color_text())
-            .add_modifier(Modifier::REVERSED);
+        let selected_style = crate::ui::style::styles::selection_style(true);
+        let selected_inactive = crate::ui::style::styles::selection_style(false);
         let highlight_style = Style::default()
             .fg(theme::color_primary())
             .add_modifier(Modifier::BOLD);

@@ -2125,8 +2125,9 @@ impl App {
 
         self.hit_tab_bar = tab_area;
 
-        // Tab bar
-        render_tab_bar(self.active_tab, tab_area, f.buffer_mut());
+        // Tab bar with breadcrumb of the current context
+        let breadcrumb = self.breadcrumb();
+        render_tab_bar(self.active_tab, &breadcrumb, tab_area, f.buffer_mut());
 
         // Clamp active_panel in case the allowed range changed (layout toggled).
         let max_panels = self.max_panels();
@@ -2360,6 +2361,54 @@ impl App {
     }
 
     /// Number of tab-cyclable panels for the current tab in the current layout mode.
+    /// Builds the navigation context shown right-aligned in the tab bar
+    /// (e.g. "my-cluster › my-service"). Empty when nothing is selected.
+    fn breadcrumb(&self) -> String {
+        let sep = " › ";
+        let parts: Vec<String> = match self.active_tab {
+            TAB_ECS | TAB_TASKS => {
+                let mut p = vec![];
+                if let Some(c) = self.clusters.selected() {
+                    p.push(c.cluster_name.clone());
+                }
+                if let Some(s) = self.services.selected() {
+                    p.push(s.service_name.clone());
+                }
+                p
+            }
+            TAB_SSM => self
+                .instances
+                .selected()
+                .map(|i| {
+                    let label = if i.name.is_empty() { &i.id } else { &i.name };
+                    vec![label.clone()]
+                })
+                .unwrap_or_default(),
+            TAB_LOGS => self
+                .log_groups
+                .selected()
+                .map(|g| vec![g.log_group_name.clone()])
+                .unwrap_or_default(),
+            TAB_RDS => {
+                let mut p = vec![];
+                if let Some(i) = self.rds_instances.selected() {
+                    p.push(i.db_instance_identifier.clone());
+                }
+                if let Some(t) = self.rds_tables.selected() {
+                    p.push(t.clone());
+                }
+                p
+            }
+            TAB_S3 => self
+                .buckets
+                .selected()
+                .map(|b| vec![b.name.clone()])
+                .unwrap_or_default(),
+            _ => vec![],
+        };
+        parts.join(sep)
+    }
+
     fn max_panels(&self) -> usize {
         if self.layout.mode == LayoutMode::Vertical {
             match self.active_tab {
