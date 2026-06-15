@@ -122,6 +122,33 @@ enum ResizeMode {
     Active,
 }
 
+#[derive(Clone, Copy)]
+enum ResizeDir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Which split a mouse resize-drag is currently adjusting.
+#[derive(Clone, Copy)]
+enum SplitField {
+    LeftRatio,
+    LeftVertical,
+    RdsConsole,
+    LogsDetail,
+}
+
+/// A live mouse resize: the split being dragged and the screen extent it spans
+/// (origin + size in cells) used to map cursor position → percentage.
+#[derive(Clone, Copy)]
+struct ResizeDrag {
+    field: SplitField,
+    horizontal: bool,
+    origin: u16,
+    size: u16,
+}
+
 #[derive(PartialEq)]
 enum InputMode {
     None,
@@ -263,9 +290,11 @@ pub struct App {
 
     // State
     active_tab: usize,
-    active_panel: usize,   // 0 = top panel, 1 = bottom panel
-    split_horizontal: u16, // left panel percentage (20..80)
-    split_vertical: u16,   // top panel percentage (20..80)
+    active_panel: usize,    // 0 = top panel, 1 = bottom panel
+    split_horizontal: u16,  // left panel percentage for ECS/Tasks/SSM/S3 (20..80)
+    split_sidebar: u16,     // left panel percentage for Logs/RDS (20..80)
+    split_vertical: u16,    // top panel percentage, left column (20..80)
+    split_logs_detail: u16, // Logs right viewer/detail split (20..80)
     bg_rx: mpsc::Receiver<BgMsg>,
     bg_tx: mpsc::Sender<BgMsg>,
     stream_rx: Option<mpsc::Receiver<StreamLine>>,
@@ -361,6 +390,8 @@ pub struct App {
     // Mouse drag / double-click tracking for the data grid
     grid_dragging: bool,
     last_grid_click: Option<(u16, u16, std::time::Instant)>,
+    // Live mouse resize-drag (Alt + right button)
+    resize_drag: Option<ResizeDrag>,
 
     // Layout adaptation
     layout_mode_override: Option<LayoutMode>,
@@ -414,7 +445,9 @@ impl App {
             active_tab: TAB_ECS,
             active_panel: 0,
             split_horizontal: 50,
+            split_sidebar: 25,
             split_vertical: 60,
+            split_logs_detail: 60,
             bg_rx,
             bg_tx,
             stream_rx: None,
@@ -482,6 +515,7 @@ impl App {
             hit_console: Rect::default(),
             grid_dragging: false,
             last_grid_click: None,
+            resize_drag: None,
             layout_mode_override: None,
             resize_mode: ResizeMode::Inactive,
         }
@@ -1083,6 +1117,31 @@ impl App {
             return false;
         }
 
+        // 4a. Resize mode is modal: while active it owns the arrow keys (so they
+        //     resize instead of being eaten by panel navigation), Esc/Ctrl+N exit.
+        if self.resize_mode == ResizeMode::Active {
+            match key.code {
+                KeyCode::Left => self.adjust_focused_panel(ResizeDir::Left),
+                KeyCode::Right => self.adjust_focused_panel(ResizeDir::Right),
+                KeyCode::Up => self.adjust_focused_panel(ResizeDir::Up),
+                KeyCode::Down => self.adjust_focused_panel(ResizeDir::Down),
+                KeyCode::Esc => self.resize_mode = ResizeMode::Inactive,
+                _ if km.resize_mode.matches(&key) => self.resize_mode = ResizeMode::Inactive,
+                _ => {}
+            }
+            return false;
+        }
+        // Enter resize mode (horizontal layout only).
+        if km.resize_mode.matches(&key) {
+            if self.layout.mode == LayoutMode::Horizontal {
+                self.resize_mode = ResizeMode::Active;
+            } else {
+                self.info = Some("Resize disabled in vertical layout".to_string());
+                self.msg_time = Some(std::time::Instant::now());
+            }
+            return false;
+        }
+
         // 4b. File browser modal (open/save .sql scripts)
         if self.file_browser.is_visible() {
             let outcome = self.file_browser.handle_key(key);
@@ -1216,42 +1275,6 @@ impl App {
                 self.loading = false;
                 self.spinner.stop();
                 return false;
-            }
-            return false;
-        }
-
-        // 6. Resize mode — exclusive: arrows adjust splits, Esc/toggle exits.
-        //    Only meaningful in horizontal layout; in vertical mode the toggle is a no-op.
-        if km.resize_mode.matches(&key) {
-            if self.layout.mode == LayoutMode::Horizontal {
-                self.resize_mode = match self.resize_mode {
-                    ResizeMode::Inactive => ResizeMode::Active,
-                    ResizeMode::Active => ResizeMode::Inactive,
-                };
-            } else {
-                self.info = Some("Resize disabled in vertical layout".to_string());
-                self.msg_time = Some(std::time::Instant::now());
-            }
-            return false;
-        }
-        if self.resize_mode == ResizeMode::Active {
-            match key.code {
-                KeyCode::Left => {
-                    self.split_horizontal = self.split_horizontal.saturating_sub(2).max(20);
-                }
-                KeyCode::Right => {
-                    self.split_horizontal = (self.split_horizontal + 2).min(80);
-                }
-                KeyCode::Up => {
-                    self.split_vertical = self.split_vertical.saturating_sub(2).max(20);
-                }
-                KeyCode::Down => {
-                    self.split_vertical = (self.split_vertical + 2).min(80);
-                }
-                KeyCode::Esc => {
-                    self.resize_mode = ResizeMode::Inactive;
-                }
-                _ => {}
             }
             return false;
         }
@@ -2390,6 +2413,13 @@ impl App {
                     return;
                 }
 
+                // Click exactly on a panel divider → start a drag-resize (no
+                // modifier needed; works on terminals that don't deliver Alt/right).
+                if let Some(drag) = self.pick_divider(col, row, 1) {
+                    self.resize_drag = Some(drag);
+                    return;
+                }
+
                 // SQL console click → focus it.
                 if self.active_tab == TAB_RDS
                     && self.console_visible
@@ -2448,7 +2478,10 @@ impl App {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                if self.grid_dragging {
+                // A divider drag-resize takes precedence over cell selection.
+                if let Some(drag) = self.resize_drag {
+                    self.apply_resize_drag(drag, col, row);
+                } else if self.grid_dragging {
                     if let Some((r, c)) = self.query_results.cell_at(col, row) {
                         self.query_results.drag_selection(r, c);
                     }
@@ -2456,6 +2489,22 @@ impl App {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.grid_dragging = false;
+                self.resize_drag = None;
+            }
+            // Alt + right button: also starts a divider drag (looser threshold)
+            // for terminals that report it.
+            MouseEventKind::Down(MouseButton::Right) => {
+                if mouse.modifiers.contains(KeyModifiers::ALT) {
+                    self.resize_drag = self.pick_divider(col, row, 3);
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Right) => {
+                if let Some(drag) = self.resize_drag {
+                    self.apply_resize_drag(drag, col, row);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Right) => {
+                self.resize_drag = None;
             }
             MouseEventKind::ScrollUp => {
                 // Shift+wheel over the data grid scrolls horizontally.
@@ -2518,6 +2567,97 @@ impl App {
         self.active_tab == TAB_RDS
             && self.rds_connection.is_some()
             && self.is_in_rect(col, row, self.hit_right_panel)
+    }
+
+    /// Pick the panel divider nearest the cursor for a mouse resize-drag.
+    /// Candidates are derived from the hit rects captured during render.
+    fn pick_divider(&self, col: u16, row: u16, max_dist: u16) -> Option<ResizeDrag> {
+        if self.layout.mode != LayoutMode::Horizontal {
+            return None;
+        }
+        let left = self.hit_top_panel;
+        let right = self.hit_right_panel;
+        let bottom = self.hit_bottom_panel;
+        if left.width == 0 || right.width == 0 {
+            return None;
+        }
+
+        let mut best: Option<(u16, ResizeDrag)> = None;
+        let mut consider = |dist: u16, drag: ResizeDrag| {
+            if best.as_ref().map(|(d, _)| dist < *d).unwrap_or(true) {
+                best = Some((dist, drag));
+            }
+        };
+
+        // Vertical divider between left and right columns.
+        let x_div = right.x;
+        consider(
+            col.abs_diff(x_div),
+            ResizeDrag {
+                field: SplitField::LeftRatio,
+                horizontal: true,
+                origin: left.x,
+                size: (right.x + right.width).saturating_sub(left.x),
+            },
+        );
+
+        // Horizontal divider between the two left-column panels (cursor in left).
+        if col < right.x {
+            let y_div = bottom.y;
+            consider(
+                row.abs_diff(y_div),
+                ResizeDrag {
+                    field: SplitField::LeftVertical,
+                    horizontal: false,
+                    origin: left.y,
+                    size: (bottom.y + bottom.height).saturating_sub(left.y),
+                },
+            );
+        } else {
+            // Right-column inner split, depending on the tab.
+            if self.active_tab == TAB_RDS && self.console_visible && self.hit_console.height > 0 {
+                let y_div = right.y; // grid starts here, console above
+                consider(
+                    row.abs_diff(y_div),
+                    ResizeDrag {
+                        field: SplitField::RdsConsole,
+                        horizontal: false,
+                        origin: self.hit_console.y,
+                        size: (right.y + right.height).saturating_sub(self.hit_console.y),
+                    },
+                );
+            } else if self.active_tab == TAB_LOGS {
+                let y_div = right.y + right.height * self.split_logs_detail / 100;
+                consider(
+                    row.abs_diff(y_div),
+                    ResizeDrag {
+                        field: SplitField::LogsDetail,
+                        horizontal: false,
+                        origin: right.y,
+                        size: right.height,
+                    },
+                );
+            }
+        }
+
+        // Only engage if the cursor is close enough to a divider.
+        best.filter(|(d, _)| *d <= max_dist).map(|(_, drag)| drag)
+    }
+
+    /// Update the dragged split from the current cursor position.
+    fn apply_resize_drag(&mut self, drag: ResizeDrag, col: u16, row: u16) {
+        if drag.size == 0 {
+            return;
+        }
+        let pos = if drag.horizontal { col } else { row };
+        let rel = pos.saturating_sub(drag.origin) as i32;
+        let ratio = (rel * 100 / drag.size as i32).clamp(20, 80) as u16;
+        match drag.field {
+            SplitField::LeftRatio => self.set_left_ratio(ratio),
+            SplitField::LeftVertical => self.split_vertical = ratio,
+            SplitField::RdsConsole => self.split_rds_console = ratio,
+            SplitField::LogsDetail => self.split_logs_detail = ratio,
+        }
     }
 
     fn is_in_rect(&self, col: u16, row: u16, rect: Rect) -> bool {
@@ -2594,12 +2734,8 @@ impl App {
             return;
         }
 
-        // Content: left (50%) + right (50%)
-        let h_ratio = if self.active_tab == TAB_LOGS || self.active_tab == TAB_RDS {
-            25
-        } else {
-            self.split_horizontal
-        };
+        // Content: left + right (ratio depends on the tab; all resizable).
+        let h_ratio = self.left_ratio();
         let content_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -2651,7 +2787,8 @@ impl App {
                 } else if let Some(cluster) = self.clusters.selected() {
                     self.detail.set_lines(format_cluster_detail(cluster));
                 }
-                self.detail.render(right_area, f.buffer_mut(), false);
+                self.detail
+                    .render(right_area, f.buffer_mut(), self.active_panel == 2);
             }
             TAB_TASKS => {
                 self.tasks.render(
@@ -2677,7 +2814,8 @@ impl App {
                     } else if let Some(task) = self.tasks.selected() {
                         self.detail.set_lines(format_task_detail(task));
                     }
-                    self.detail.render(right_area, f.buffer_mut(), false);
+                    self.detail
+                        .render(right_area, f.buffer_mut(), self.active_panel == 2);
                 }
             }
             TAB_SSM => {
@@ -2691,7 +2829,8 @@ impl App {
                 if let Some(inst) = self.instances.selected() {
                     self.detail.set_lines(format_instance_detail(inst));
                 }
-                self.detail.render(right_area, f.buffer_mut(), false);
+                self.detail
+                    .render(right_area, f.buffer_mut(), self.active_panel == 2);
             }
             TAB_LOGS => {
                 self.log_groups.render(
@@ -2707,12 +2846,13 @@ impl App {
                     self.loading_log_streams,
                 );
 
-                // Right side: split into log list (top) + log detail (bottom)
+                // Right side: split into log list (top) + log detail (bottom).
+                // Dedicated ratio (decoupled from the left column's split).
                 let right_panels = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Percentage(self.split_vertical),
-                        Constraint::Percentage(100 - self.split_vertical),
+                        Constraint::Percentage(self.split_logs_detail),
+                        Constraint::Percentage(100 - self.split_logs_detail),
                     ])
                     .split(right_area);
 
@@ -2776,7 +2916,8 @@ impl App {
                     if let Some(inst) = self.rds_instances.selected() {
                         self.detail.set_lines(format_rds_instance_detail(inst));
                     }
-                    self.detail.render(right_area, f.buffer_mut(), false);
+                    self.detail
+                        .render(right_area, f.buffer_mut(), self.active_panel == 2);
                 }
             }
             TAB_S3 => {
@@ -2814,7 +2955,8 @@ impl App {
                 } else if let Some(bucket) = self.buckets.selected() {
                     self.detail.set_lines(format_bucket_detail(bucket));
                 }
-                self.detail.render(right_area, f.buffer_mut(), false);
+                self.detail
+                    .render(right_area, f.buffer_mut(), self.active_panel == 2);
             }
             _ => {}
         }
@@ -2890,8 +3032,65 @@ impl App {
         } else {
             match self.active_tab {
                 TAB_RDS if self.rds_connection.is_some() && self.console_visible => 4,
-                TAB_LOGS | TAB_RDS => 3,
-                _ => 2,
+                // Right panel (detail/viewer/grid) is focusable everywhere so it
+                // can be focused and resized — no panel is an exception.
+                _ => 3,
+            }
+        }
+    }
+
+    fn left_ratio(&self) -> u16 {
+        if self.active_tab == TAB_LOGS || self.active_tab == TAB_RDS {
+            self.split_sidebar
+        } else {
+            self.split_horizontal
+        }
+    }
+
+    fn set_left_ratio(&mut self, v: u16) {
+        if self.active_tab == TAB_LOGS || self.active_tab == TAB_RDS {
+            self.split_sidebar = v;
+        } else {
+            self.split_horizontal = v;
+        }
+    }
+
+    /// The vertical split field for the focused panel's column, if any.
+    fn vertical_split_field(&mut self) -> Option<&mut u16> {
+        match self.active_panel {
+            0 | 1 => Some(&mut self.split_vertical),
+            2 | 3 if self.active_tab == TAB_RDS => Some(&mut self.split_rds_console),
+            2 if self.active_tab == TAB_LOGS => Some(&mut self.split_logs_detail),
+            _ => None, // right detail panel has no internal vertical split
+        }
+    }
+
+    /// Resize by moving a divider in the arrow's direction (predictable, like
+    /// tmux): `→`/`←` move the left|right divider; `↓`/`↑` move the focused
+    /// column's horizontal divider. The focused panel only selects *which*
+    /// vertical divider is affected.
+    fn adjust_focused_panel(&mut self, dir: ResizeDir) {
+        const STEP: i32 = 3;
+        match dir {
+            ResizeDir::Left | ResizeDir::Right => {
+                let step = if matches!(dir, ResizeDir::Right) {
+                    STEP
+                } else {
+                    -STEP
+                };
+                let v = (self.left_ratio() as i32 + step).clamp(20, 80) as u16;
+                self.set_left_ratio(v);
+            }
+            ResizeDir::Up | ResizeDir::Down => {
+                let step = if matches!(dir, ResizeDir::Down) {
+                    STEP
+                } else {
+                    -STEP
+                };
+                if let Some(f) = self.vertical_split_field() {
+                    let v = (*f as i32 + step).clamp(20, 80) as u16;
+                    *f = v;
+                }
             }
         }
     }
@@ -3057,12 +3256,16 @@ impl App {
         let hints = if self.resize_mode == ResizeMode::Active {
             vec![
                 Hint {
+                    key: "RESIZE".to_string(),
+                    desc: "focused panel".to_string(),
+                },
+                Hint {
                     key: "←→".to_string(),
-                    desc: "h-split".to_string(),
+                    desc: "width".to_string(),
                 },
                 Hint {
                     key: "↑↓".to_string(),
-                    desc: "v-split".to_string(),
+                    desc: "height".to_string(),
                 },
                 Hint {
                     key: "Esc".to_string(),
@@ -6082,5 +6285,73 @@ mod sql_helpers_tests {
             "SELECT * FROM t LIMIT 5"
         );
         assert_eq!(with_default_limit("SHOW TABLES"), "SHOW TABLES");
+    }
+}
+
+#[cfg(test)]
+mod resize_tests {
+    use super::*;
+
+    fn app() -> App {
+        App::new("aws".to_string(), None, "us-east-1".to_string())
+    }
+
+    #[test]
+    fn right_arrow_moves_divider_right_regardless_of_focus() {
+        // The divider follows the arrow direction, not the focused panel.
+        let mut a = app();
+        a.active_tab = TAB_ECS;
+        a.active_panel = 0;
+        assert_eq!(a.split_horizontal, 50);
+        a.adjust_focused_panel(ResizeDir::Right);
+        assert_eq!(a.split_horizontal, 53);
+        a.adjust_focused_panel(ResizeDir::Left);
+        assert_eq!(a.split_horizontal, 50);
+
+        // Same direction even when the right panel is focused.
+        a.active_panel = 2;
+        a.adjust_focused_panel(ResizeDir::Right);
+        assert_eq!(a.split_horizontal, 53);
+    }
+
+    #[test]
+    fn vertical_split_moves_with_arrows() {
+        let mut a = app();
+        a.active_tab = TAB_ECS;
+        a.active_panel = 0;
+        assert_eq!(a.split_vertical, 60);
+        a.adjust_focused_panel(ResizeDir::Down);
+        assert_eq!(a.split_vertical, 63);
+        a.adjust_focused_panel(ResizeDir::Up);
+        assert_eq!(a.split_vertical, 60);
+    }
+
+    #[test]
+    fn rds_uses_sidebar_and_console_splits() {
+        let mut a = app();
+        a.active_tab = TAB_RDS;
+        a.active_panel = 0;
+        assert_eq!(a.left_ratio(), 25); // sidebar default
+        a.adjust_focused_panel(ResizeDir::Right);
+        assert_eq!(a.split_sidebar, 28);
+        // Console panel (3) resizes the console/grid split.
+        a.active_panel = 3;
+        a.adjust_focused_panel(ResizeDir::Down);
+        assert_eq!(a.split_rds_console, 38);
+    }
+
+    #[test]
+    fn ratio_is_clamped() {
+        let mut a = app();
+        a.active_tab = TAB_ECS;
+        a.active_panel = 0;
+        for _ in 0..50 {
+            a.adjust_focused_panel(ResizeDir::Right);
+        }
+        assert_eq!(a.split_horizontal, 80);
+        for _ in 0..50 {
+            a.adjust_focused_panel(ResizeDir::Left);
+        }
+        assert_eq!(a.split_horizontal, 20);
     }
 }

@@ -216,12 +216,8 @@ fn help_sections() -> Vec<HelpSection> {
                     desc: "search / filter".to_string(),
                 },
                 Hint {
-                    key: "< / >".to_string(),
-                    desc: "resize left/right".to_string(),
-                },
-                Hint {
-                    key: "- / +".to_string(),
-                    desc: "resize top/bottom".to_string(),
+                    key: "Ctrl+n".to_string(),
+                    desc: "resize mode (then arrows / Alt+right-drag)".to_string(),
                 },
             ],
         },
@@ -446,12 +442,24 @@ fn help_sections() -> Vec<HelpSection> {
             title: "Resize".to_string(),
             bindings: vec![
                 Hint {
-                    key: "< / >".to_string(),
-                    desc: "resize left/right split".to_string(),
+                    key: "Ctrl+n".to_string(),
+                    desc: "toggle resize mode".to_string(),
                 },
                 Hint {
-                    key: "- / +".to_string(),
-                    desc: "resize top/bottom split".to_string(),
+                    key: "←→".to_string(),
+                    desc: "resize focused panel width".to_string(),
+                },
+                Hint {
+                    key: "↑↓".to_string(),
+                    desc: "resize focused panel height".to_string(),
+                },
+                Hint {
+                    key: "drag border".to_string(),
+                    desc: "click a panel border and drag (mouse)".to_string(),
+                },
+                Hint {
+                    key: "Esc".to_string(),
+                    desc: "leave resize mode".to_string(),
                 },
             ],
         },

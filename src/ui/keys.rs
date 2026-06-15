@@ -251,8 +251,8 @@ pub fn default_key_map() -> KeyMap {
             help_desc: "execute modify".to_string(),
         },
         resize_mode: KeyBinding {
-            keys: vec![key_ctrl(KeyCode::Char('r'))],
-            help_key: "Ctrl+r".to_string(),
+            keys: vec![key_ctrl(KeyCode::Char('n'))],
+            help_key: "Ctrl+n".to_string(),
             help_desc: "resize mode".to_string(),
         },
         layout_toggle: KeyBinding {
