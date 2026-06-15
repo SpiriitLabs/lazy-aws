@@ -12,8 +12,12 @@ pub struct LogViewerPanel {
     pub cursor: usize, // position in the filtered list
     pub scroll_y: usize,
     pub follow: bool,
+    pub show_timestamps: bool,
     last_visible_height: usize,
 }
+
+/// Largeur de la gouttière timestamp : "HH:MM:SS" + 1 espace.
+const TS_GUTTER_W: usize = 9;
 
 impl Default for LogViewerPanel {
     fn default() -> Self {
@@ -30,8 +34,14 @@ impl LogViewerPanel {
             cursor: 0,
             scroll_y: 0,
             follow: true,
+            show_timestamps: true,
             last_visible_height: 20,
         }
+    }
+
+    /// Bascule l'affichage de la gouttière timestamp (touche `t`).
+    pub fn toggle_timestamps(&mut self) {
+        self.show_timestamps = !self.show_timestamps;
     }
 
     /// Returns the visible lines (filtered or all).
@@ -57,10 +67,14 @@ impl LogViewerPanel {
     pub fn set_filter(&mut self, filter: &str) {
         self.filter = filter.to_string();
         self.rebuild_filter();
-        self.cursor = 0;
-        self.scroll_y = 0;
-        if self.filter.is_empty() {
-            self.follow = true;
+        // Le suivi live est préservé : si on suivait, on se recale au bas de la
+        // liste filtrée pour continuer à voir arriver les lignes qui matchent.
+        // Sinon on revient en haut de la nouvelle liste filtrée.
+        if self.follow {
+            self.go_to_bottom();
+        } else {
+            self.cursor = 0;
+            self.scroll_y = 0;
         }
     }
 
@@ -182,22 +196,38 @@ impl LogViewerPanel {
         };
 
         let count = self.visible_count();
-        let follow_indicator = if self.follow { " follow" } else { "" };
         let filter_indicator = if self.filter.is_empty() {
             String::new()
         } else {
             format!(" filter:\"{}\"", self.filter)
         };
+        // Indicateur d'état du suivi : ● LIVE (vert) quand on suit, sinon
+        // ⏸ PAUSED (jaune). Avec un filtre actif on précise la cause.
+        let (follow_label, follow_color) = if self.follow {
+            ("● LIVE", theme::color_success())
+        } else if self.filter.is_empty() {
+            ("⏸ PAUSED", theme::color_warning())
+        } else {
+            ("⏸ PAUSED (filter)", theme::color_warning())
+        };
         let title = format!(
-            " Logs [{}/{}]{}{} ",
+            " Logs [{}/{}]{} ",
             if count == 0 { 0 } else { self.cursor + 1 },
             count,
-            follow_indicator,
             filter_indicator,
         );
 
         let block = Block::default()
             .title(title)
+            .title_top(
+                ratatui::text::Line::from(ratatui::text::Span::styled(
+                    format!(" {follow_label} "),
+                    Style::default()
+                        .fg(follow_color)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .right_aligned(),
+            )
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border_color));
         let inner = block.inner(area);
@@ -236,7 +266,14 @@ impl LogViewerPanel {
         let highlight_style = Style::default()
             .fg(theme::color_primary())
             .add_modifier(Modifier::BOLD);
-        let arrow_style = Style::default().fg(theme::color_muted());
+        let muted_style = Style::default().fg(theme::color_muted());
+
+        // Quand les timestamps sont affichés, on réserve une gouttière de
+        // largeur fixe à gauche pour que les messages restent alignés (même
+        // pour les lignes sans timestamp, comme "-- tail ended --").
+        let gutter_w = if self.show_timestamps { TS_GUTTER_W } else { 0 };
+        let msg_x = inner.x + 1 + gutter_w as u16;
+        let msg_w = visible_w.saturating_sub(gutter_w);
 
         for (i, line) in display_lines.iter().skip(offset).enumerate() {
             if i >= visible_h {
@@ -246,41 +283,92 @@ impl LogViewerPanel {
             let line_idx = i + offset;
             let is_selected = line_idx == self.cursor;
 
+            let (ts, msg) = if self.show_timestamps {
+                split_timestamp(line)
+            } else {
+                (None, *line)
+            };
+
+            // Gouttière timestamp (toujours en muted, y compris ligne sélectionnée).
+            if self.show_timestamps {
+                let ts_text = ts.as_deref().unwrap_or("");
+                let padded = format!("{:<width$}", ts_text, width = gutter_w);
+                buf.set_string(inner.x + 1, y, &padded, muted_style);
+            }
+
+            // Style du message selon le niveau de log détecté.
+            let level_style = match theme::log_level_color(line) {
+                Some(c) => Style::default().fg(c),
+                None => normal_style,
+            };
             let base_style = if is_selected && is_active {
                 selected_style
             } else if is_selected {
                 selected_inactive
             } else {
-                normal_style
+                level_style
             };
 
-            let truncated: String = line.chars().take(visible_w).collect();
+            let truncated: String = msg.chars().take(msg_w).collect();
 
             if is_selected {
-                let padded = format!("{:<width$}", truncated, width = visible_w);
-                buf.set_string(inner.x + 1, y, &padded, base_style);
+                let padded = format!("{:<width$}", truncated, width = msg_w);
+                buf.set_string(msg_x, y, &padded, base_style);
             } else if !self.filter.is_empty() {
                 // Highlight matching text in non-selected lines
                 render_highlighted_line(
                     buf,
-                    inner.x + 1,
+                    msg_x,
                     y,
                     &truncated,
                     &self.filter,
-                    normal_style,
+                    level_style,
                     highlight_style,
-                    visible_w,
+                    msg_w,
                 );
             } else {
-                buf.set_string(inner.x + 1, y, &truncated, base_style);
+                buf.set_string(msg_x, y, &truncated, base_style);
             }
 
-            if line.len() > visible_w && !is_selected {
+            if msg.chars().count() > msg_w && !is_selected {
                 let arrow_x = inner.x + inner.width.saturating_sub(1);
-                buf.set_string(arrow_x, y, "→", arrow_style);
+                buf.set_string(arrow_x, y, "→", muted_style);
             }
         }
     }
+}
+
+/// Si la ligne commence par un timestamp ISO8601 (format émis par
+/// `aws logs tail`), renvoie `(Some("HH:MM:SS"), reste_du_message)`.
+/// Sinon renvoie `(None, ligne_complète)`.
+fn split_timestamp(line: &str) -> (Option<String>, &str) {
+    if let Some((first, rest)) = line.split_once(' ') {
+        if let Some(hms) = iso_to_hms(first) {
+            return (Some(hms), rest);
+        }
+    }
+    (None, line)
+}
+
+/// Extrait `HH:MM:SS` d'un token type `2026-06-15T12:00:00.000+00:00`.
+fn iso_to_hms(token: &str) -> Option<String> {
+    let t_pos = token.find('T')?;
+    let after_t = &token[t_pos + 1..];
+    if after_t.len() >= 8 {
+        let b = after_t.as_bytes();
+        if b[2] == b':'
+            && b[5] == b':'
+            && b[0].is_ascii_digit()
+            && b[1].is_ascii_digit()
+            && b[3].is_ascii_digit()
+            && b[4].is_ascii_digit()
+            && b[6].is_ascii_digit()
+            && b[7].is_ascii_digit()
+        {
+            return Some(after_t[..8].to_string());
+        }
+    }
+    None
 }
 
 /// Renders a line with filter matches highlighted.
@@ -373,6 +461,10 @@ pub fn render_log_detail(line: &str, area: Rect, buf: &mut Buffer, is_active: bo
 
     let main_content = main_parts.join(" | ");
 
+    // Couleur selon le niveau de log détecté (rouge/jaune/gris), repli sur
+    // bright pour les lignes "normales" — cohérent avec la liste.
+    let content_color = theme::log_level_color(&main_content).unwrap_or_else(theme::color_bright);
+
     // Reserve space for @ptr at the bottom (separator line + ptr line(s))
     let ptr_lines = if let Some(ptr) = ptr_value {
         let ptr_text = format!("@ptr {ptr}");
@@ -384,7 +476,7 @@ pub fn render_log_detail(line: &str, area: Rect, buf: &mut Buffer, is_active: bo
     let main_visible_h = visible_h.saturating_sub(ptr_lines);
 
     // Render main content with word-wrap
-    let style = Style::default().fg(theme::color_bright());
+    let style = Style::default().fg(content_color);
     let mut y = 0usize;
 
     for text_line in main_content.split('\n') {
@@ -426,5 +518,54 @@ pub fn render_log_detail(line: &str, area: Rect, buf: &mut Buffer, is_active: bo
             let s: String = chunk.iter().collect();
             buf.set_string(inner.x + 1, py, &s, ptr_style);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_timestamp_iso() {
+        let (ts, rest) = split_timestamp("2026-06-15T12:34:56.000+00:00 hello world");
+        assert_eq!(ts.as_deref(), Some("12:34:56"));
+        assert_eq!(rest, "hello world");
+    }
+
+    #[test]
+    fn split_timestamp_none_for_plain_line() {
+        let (ts, rest) = split_timestamp("-- tail ended --");
+        assert_eq!(ts, None);
+        assert_eq!(rest, "-- tail ended --");
+
+        let (ts, rest) = split_timestamp("Error: boom");
+        assert_eq!(ts, None);
+        assert_eq!(rest, "Error: boom");
+    }
+
+    #[test]
+    fn follow_preserved_under_filter() {
+        let mut p = LogViewerPanel::new();
+        for i in 0..10 {
+            p.append_line(&format!("line {i} INFO"));
+        }
+        p.append_line("line 10 ERROR boom");
+        assert!(p.follow, "should follow by default");
+
+        // Poser un filtre ne doit pas couper le suivi : on reste calé en bas.
+        p.set_filter("ERROR");
+        assert!(p.follow, "follow must survive a filter change");
+        assert_eq!(p.visible_lines().len(), 1);
+        assert_eq!(p.selected_line(), Some("line 10 ERROR boom"));
+    }
+
+    #[test]
+    fn manual_scroll_pauses_follow() {
+        let mut p = LogViewerPanel::new();
+        for i in 0..10 {
+            p.append_line(&format!("line {i}"));
+        }
+        p.move_up();
+        assert!(!p.follow, "manual navigation pauses follow");
     }
 }

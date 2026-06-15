@@ -104,6 +104,7 @@ enum BgMsg {
 enum ChoiceMode {
     ProfileSelector,
     TimeRangeSelector,
+    TailTimeRange,
     QueryTemplate,
     QueryHistory,
     ShellSelector,
@@ -906,6 +907,9 @@ impl App {
                         ChoiceMode::TimeRangeSelector => {
                             self.handle_time_range_choice(c);
                         }
+                        ChoiceMode::TailTimeRange => {
+                            self.handle_tail_time_choice(c);
+                        }
                         ChoiceMode::QueryTemplate => {
                             self.apply_query_template(c);
                         }
@@ -1126,6 +1130,10 @@ impl App {
                 }
                 KeyCode::Char('G') => {
                     self.log_viewer.go_to_bottom();
+                    return false;
+                }
+                KeyCode::Char('t') => {
+                    self.log_viewer.toggle_timestamps();
                     return false;
                 }
                 KeyCode::Char('/') => {
@@ -2879,6 +2887,53 @@ impl App {
     }
 
     fn handle_live_tail(&mut self) {
+        if self.log_groups.selected().is_none() {
+            self.set_error("No log group selected".to_string());
+            return;
+        }
+        // Demander la plage de temps avant de lancer le tail.
+        self.choice_mode = ChoiceMode::TailTimeRange;
+        self.choice.show(
+            "Tail since",
+            vec![
+                Choice {
+                    key: '1',
+                    label: "5 minutes".to_string(),
+                },
+                Choice {
+                    key: '2',
+                    label: "15 minutes".to_string(),
+                },
+                Choice {
+                    key: '3',
+                    label: "1 hour".to_string(),
+                },
+                Choice {
+                    key: '4',
+                    label: "6 hours".to_string(),
+                },
+                Choice {
+                    key: '5',
+                    label: "1 day".to_string(),
+                },
+            ],
+        );
+    }
+
+    fn handle_tail_time_choice(&mut self, c: char) {
+        // Valeurs au format accepté par `aws logs tail --since`.
+        let since = match c {
+            '1' => "5m",
+            '2' => "15m",
+            '3' => "1h",
+            '4' => "6h",
+            '5' => "1d",
+            _ => return,
+        };
+        self.start_live_tail(since);
+    }
+
+    fn start_live_tail(&mut self, since: &str) {
         let runner = match &self.runner {
             Some(r) => Arc::clone(r),
             None => return,
@@ -2891,13 +2946,13 @@ impl App {
             }
         };
 
-        log::info!("starting live tail for {group}");
+        log::info!("starting live tail for {group} (since {since})");
         self.log_viewer.clear();
         self.log_viewer.follow = true;
         self.log_viewer
-            .append_line(&format!("-- tailing {group} --"));
+            .append_line(&format!("-- tailing {group} (since {since}) --"));
 
-        match runner.tail_logs(&group, "5m") {
+        match runner.tail_logs(&group, since) {
             Ok(handle) => {
                 self.stream_rx = Some(handle.rx);
                 self.child_pid = handle.child_pid;

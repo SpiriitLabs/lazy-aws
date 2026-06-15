@@ -166,6 +166,18 @@ pub fn default_hints(tab: usize) -> Vec<Hint> {
                 desc: "Insights".to_string(),
             });
             hints.push(Hint {
+                key: "/".to_string(),
+                desc: "filter".to_string(),
+            });
+            hints.push(Hint {
+                key: "t".to_string(),
+                desc: "timestamps".to_string(),
+            });
+            hints.push(Hint {
+                key: "g/G".to_string(),
+                desc: "top/bottom".to_string(),
+            });
+            hints.push(Hint {
                 key: "S".to_string(),
                 desc: "export".to_string(),
             });
