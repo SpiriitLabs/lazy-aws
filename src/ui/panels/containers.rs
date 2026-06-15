@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 
 use crate::aws::Container;
+use crate::ui::fuzzy::fuzzy_match;
 use crate::ui::style::{styles, theme};
 
 pub struct ContainersPanel {
@@ -45,18 +46,21 @@ impl ContainersPanel {
     }
 
     fn rebuild_filter(&mut self) {
-        let lower = self.filter.to_lowercase();
-        self.filtered = self
-            .containers
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| {
-                lower.is_empty()
-                    || c.name.to_lowercase().contains(&lower)
-                    || c.image.to_lowercase().contains(&lower)
-            })
-            .map(|(i, _)| i)
-            .collect();
+        if self.filter.is_empty() {
+            self.filtered = (0..self.containers.len()).collect();
+        } else {
+            let mut scored: Vec<(usize, i32)> = self
+                .containers
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| {
+                    let hay = format!("{} {}", c.name, c.image);
+                    fuzzy_match(&hay, &self.filter).map(|s| (i, s))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.1.cmp(&a.1));
+            self.filtered = scored.into_iter().map(|(i, _)| i).collect();
+        }
         let count = self.filtered.len();
         if self.cursor >= count && count > 0 {
             self.cursor = count - 1;

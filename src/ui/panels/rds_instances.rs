@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 
 use crate::aws::DbInstance;
+use crate::ui::fuzzy::fuzzy_match;
 use crate::ui::style::{styles, theme};
 
 pub struct RdsInstancesPanel {
@@ -45,18 +46,21 @@ impl RdsInstancesPanel {
     }
 
     fn rebuild_filter(&mut self) {
-        let lower = self.filter.to_lowercase();
-        self.filtered = self
-            .instances
-            .iter()
-            .enumerate()
-            .filter(|(_, i)| {
-                lower.is_empty()
-                    || i.db_instance_identifier.to_lowercase().contains(&lower)
-                    || i.engine.to_lowercase().contains(&lower)
-            })
-            .map(|(i, _)| i)
-            .collect();
+        if self.filter.is_empty() {
+            self.filtered = (0..self.instances.len()).collect();
+        } else {
+            let mut scored: Vec<(usize, i32)> = self
+                .instances
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, i)| {
+                    let hay = format!("{} {}", i.db_instance_identifier, i.engine);
+                    fuzzy_match(&hay, &self.filter).map(|s| (idx, s))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.1.cmp(&a.1));
+            self.filtered = scored.into_iter().map(|(i, _)| i).collect();
+        }
         let count = self.filtered.len();
         if self.cursor >= count && count > 0 {
             self.cursor = count - 1;

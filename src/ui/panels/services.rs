@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 
 use crate::aws::Service;
+use crate::ui::fuzzy::fuzzy_match;
 use crate::ui::style::{styles, theme};
 
 pub struct ServicesPanel {
@@ -45,14 +46,18 @@ impl ServicesPanel {
     }
 
     fn rebuild_filter(&mut self) {
-        let lower = self.filter.to_lowercase();
-        self.filtered = self
-            .services
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| lower.is_empty() || s.service_name.to_lowercase().contains(&lower))
-            .map(|(i, _)| i)
-            .collect();
+        if self.filter.is_empty() {
+            self.filtered = (0..self.services.len()).collect();
+        } else {
+            let mut scored: Vec<(usize, i32)> = self
+                .services
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| fuzzy_match(&s.service_name, &self.filter).map(|sc| (i, sc)))
+                .collect();
+            scored.sort_by(|a, b| b.1.cmp(&a.1));
+            self.filtered = scored.into_iter().map(|(i, _)| i).collect();
+        }
         let count = self.filtered.len();
         if self.cursor >= count && count > 0 {
             self.cursor = count - 1;

@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 
 use crate::aws::Task;
+use crate::ui::fuzzy::fuzzy_match;
 use crate::ui::style::{styles, theme};
 
 pub struct TasksPanel {
@@ -45,20 +46,22 @@ impl TasksPanel {
     }
 
     fn rebuild_filter(&mut self) {
-        let lower = self.filter.to_lowercase();
-        self.filtered = self
-            .tasks
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| {
-                if lower.is_empty() {
-                    return true;
-                }
-                let id = t.task_arn.rsplit('/').next().unwrap_or("");
-                id.to_lowercase().contains(&lower) || t.last_status.to_lowercase().contains(&lower)
-            })
-            .map(|(i, _)| i)
-            .collect();
+        if self.filter.is_empty() {
+            self.filtered = (0..self.tasks.len()).collect();
+        } else {
+            let mut scored: Vec<(usize, i32)> = self
+                .tasks
+                .iter()
+                .enumerate()
+                .filter_map(|(i, t)| {
+                    let id = t.task_arn.rsplit('/').next().unwrap_or("");
+                    let hay = format!("{id} {}", t.last_status);
+                    fuzzy_match(&hay, &self.filter).map(|s| (i, s))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.1.cmp(&a.1));
+            self.filtered = scored.into_iter().map(|(i, _)| i).collect();
+        }
         let count = self.filtered.len();
         if self.cursor >= count && count > 0 {
             self.cursor = count - 1;

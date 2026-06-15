@@ -3,6 +3,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, Widget};
 
+use crate::ui::fuzzy::fuzzy_match;
 use crate::ui::style::{styles, theme};
 
 pub struct QueryResultsPanel {
@@ -103,16 +104,21 @@ impl QueryResultsPanel {
     }
 
     fn rebuild_filter(&mut self) {
-        let lower = self.filter.to_lowercase();
-        self.filtered = self
-            .rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| {
-                lower.is_empty() || row.iter().any(|cell| cell.to_lowercase().contains(&lower))
-            })
-            .map(|(i, _)| i)
-            .collect();
+        if self.filter.is_empty() {
+            self.filtered = (0..self.rows.len()).collect();
+        } else {
+            let mut scored: Vec<(usize, i32)> = self
+                .rows
+                .iter()
+                .enumerate()
+                .filter_map(|(i, row)| {
+                    let hay = row.join(" ");
+                    fuzzy_match(&hay, &self.filter).map(|s| (i, s))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.1.cmp(&a.1));
+            self.filtered = scored.into_iter().map(|(i, _)| i).collect();
+        }
         let count = self.filtered.len();
         if self.cursor >= count && count > 0 {
             self.cursor = count - 1;

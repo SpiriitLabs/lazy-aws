@@ -47,9 +47,49 @@ pub fn fuzzy_match(text: &str, pattern: &str) -> Option<i32> {
     }
 }
 
+/// Like [`fuzzy_match`] but returns the character indices in `text` that were
+/// matched (in order), for highlighting. Returns `None` if there is no match,
+/// and an empty `Vec` for an empty pattern.
+pub fn fuzzy_match_positions(text: &str, pattern: &str) -> Option<Vec<usize>> {
+    if pattern.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let text_lower: Vec<char> = text.to_lowercase().chars().collect();
+    let pattern_lower: Vec<char> = pattern.to_lowercase().chars().collect();
+
+    let mut positions = Vec::with_capacity(pattern_lower.len());
+    let mut pi = 0;
+
+    for (ti, &tc) in text_lower.iter().enumerate() {
+        if pi < pattern_lower.len() && tc == pattern_lower[pi] {
+            positions.push(ti);
+            pi += 1;
+        }
+    }
+
+    if pi == pattern_lower.len() {
+        Some(positions)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn positions_basic() {
+        assert_eq!(fuzzy_match_positions("logs", "lg"), Some(vec![0, 2]));
+        // p(0) r(1) o(2) d(3) -(4) a(5) p(6) i(7) → p,r,d,a,p,i
+        assert_eq!(
+            fuzzy_match_positions("prod-api", "prdapi"),
+            Some(vec![0, 1, 3, 5, 6, 7])
+        );
+        assert_eq!(fuzzy_match_positions("logs", "xyz"), None);
+        assert_eq!(fuzzy_match_positions("anything", ""), Some(vec![]));
+    }
 
     #[test]
     fn empty_pattern_matches_everything() {

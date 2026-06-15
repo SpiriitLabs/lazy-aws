@@ -4,6 +4,7 @@ use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, Widget};
 
 use crate::aws::LogStream;
+use crate::ui::fuzzy::fuzzy_match;
 use crate::ui::style::{styles, theme};
 
 pub struct LogStreamsPanel {
@@ -44,14 +45,20 @@ impl LogStreamsPanel {
     }
 
     fn rebuild_filter(&mut self) {
-        let lower = self.filter.to_lowercase();
-        self.filtered = self
-            .streams
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| lower.is_empty() || s.log_stream_name.to_lowercase().contains(&lower))
-            .map(|(i, _)| i)
-            .collect();
+        if self.filter.is_empty() {
+            self.filtered = (0..self.streams.len()).collect();
+        } else {
+            let mut scored: Vec<(usize, i32)> = self
+                .streams
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| {
+                    fuzzy_match(&s.log_stream_name, &self.filter).map(|sc| (i, sc))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.1.cmp(&a.1));
+            self.filtered = scored.into_iter().map(|(i, _)| i).collect();
+        }
         let count = self.filtered.len();
         if self.cursor >= count && count > 0 {
             self.cursor = count - 1;

@@ -669,6 +669,10 @@ impl App {
                 }
                 BgMsg::InsightsResults { status, results } => {
                     self.spinner.stop();
+                    // Each poll returns the full cumulative result set, so we
+                    // replace the snapshot instead of appending — otherwise the
+                    // same rows pile up on every poll.
+                    self.log_viewer.clear();
                     self.log_viewer.append_line(&format!("Status: {status}"));
                     for row in &results {
                         let line: Vec<String> =
@@ -677,7 +681,7 @@ impl App {
                     }
                     if status == "Complete" || status == "Failed" || status == "Cancelled" {
                         self.log_viewer
-                            .append_line(&format!("\n{} results", results.len()));
+                            .append_line(&format!("{} results", results.len()));
                         // Focus on log viewer
                         self.active_panel = 2;
                         self.log_viewer.go_to_top();
@@ -987,8 +991,37 @@ impl App {
                     _ => {}
                 }
             }
+            // In live-filter modes, Up/Down move the selection in the filtered
+            // list without leaving the search prompt (fzf-style).
+            if matches!(
+                self.input_mode,
+                InputMode::PanelFilter | InputMode::LogFilter
+            ) {
+                match key.code {
+                    KeyCode::Up => {
+                        self.navigate_up();
+                        return false;
+                    }
+                    KeyCode::Down => {
+                        self.navigate_down();
+                        return false;
+                    }
+                    _ => {}
+                }
+            }
             if let Some(action) = self.input.handle_key(key) {
                 self.handle_action(action);
+            } else if matches!(
+                self.input_mode,
+                InputMode::PanelFilter | InputMode::LogFilter
+            ) {
+                // fzf-style: apply the filter live on every keystroke.
+                let v = self.input.value();
+                match self.input_mode {
+                    InputMode::LogFilter => self.log_viewer.set_filter(&v),
+                    InputMode::PanelFilter => self.set_active_panel_filter(&v),
+                    _ => {}
+                }
             }
             return false;
         }
@@ -1574,6 +1607,14 @@ impl App {
                 }
             }
             Action::InputCancel => {
+                // Esc aborts the search and clears the live filter (fzf-style).
+                match self.input_mode {
+                    InputMode::LogFilter => self.log_viewer.clear_filter(),
+                    InputMode::PanelFilter => {
+                        self.clear_active_panel_filter();
+                    }
+                    _ => {}
+                }
                 self.input_mode = InputMode::None;
             }
             Action::SwitchTab(tab) => self.switch_tab(tab),
@@ -2562,6 +2603,18 @@ impl App {
     }
 
     fn render_status_bar(&self, status_area: Rect, buf: &mut ratatui::buffer::Buffer) {
+        // While a filter is being typed, the status bar becomes the fzf-style
+        // live-search prompt.
+        if self.input.is_visible()
+            && matches!(
+                self.input_mode,
+                InputMode::PanelFilter | InputMode::LogFilter
+            )
+        {
+            self.render_filter_prompt(status_area, buf);
+            return;
+        }
+
         let mut sb = StatusBar::new();
         sb.set_width(status_area.width);
         let hints = if self.resize_mode == ResizeMode::Active {
@@ -2625,6 +2678,50 @@ impl App {
         }
     }
 
+    /// Renders the fzf-style live filter prompt across the status bar row.
+    fn render_filter_prompt(&self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
+        use ratatui::style::{Color, Modifier, Style};
+        let bar_bg = if theme::mode() == theme::ThemeMode::Light {
+            Color::Rgb(0xE0, 0xE0, 0xE0)
+        } else {
+            Color::Rgb(0x1A, 0x1A, 0x1A)
+        };
+        let bg = Style::default().bg(bar_bg);
+        for x in area.x..area.x + area.width {
+            buf.set_string(x, area.y, " ", bg);
+        }
+
+        let query = self.input.value();
+        let prompt = format!("/ {query}");
+        let prompt_style = Style::default()
+            .fg(theme::color_primary())
+            .bg(bar_bg)
+            .add_modifier(Modifier::BOLD);
+        let mut x = area.x + 1;
+        buf.set_string(x, area.y, &prompt, prompt_style);
+        x += prompt.chars().count() as u16;
+
+        // Block cursor at the end of the query.
+        if x < area.x + area.width {
+            let cursor_style = Style::default()
+                .fg(theme::color_background())
+                .bg(theme::color_primary());
+            buf.set_string(x, area.y, "▋", cursor_style);
+            x += 1;
+        }
+
+        // Right-aligned hint.
+        let hint = "Enter: garder · Esc: effacer";
+        let hlen = hint.chars().count() as u16;
+        if area.width > hlen + 2 {
+            let hx = area.x + area.width - hlen - 1;
+            if hx > x + 1 {
+                let hint_style = Style::default().fg(theme::color_muted()).bg(bar_bg);
+                buf.set_string(hx, area.y, hint, hint_style);
+            }
+        }
+    }
+
     fn render_overlays(&mut self, size: Rect, f: &mut ratatui::Frame) {
         if self.help.is_visible() {
             let popup_area = centered_rect(60, 80, size);
@@ -2665,7 +2762,14 @@ impl App {
             text.render(inner, f.buffer_mut());
         }
 
-        if self.input.is_visible() {
+        // Filter modes use the inline status-bar prompt instead of the modal;
+        // all other input modes keep the centered box.
+        if self.input.is_visible()
+            && !matches!(
+                self.input_mode,
+                InputMode::PanelFilter | InputMode::LogFilter
+            )
+        {
             let popup_area = centered_rect(70, 20, size);
             self.input.render(popup_area, f.buffer_mut());
         }

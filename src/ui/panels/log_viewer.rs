@@ -83,6 +83,9 @@ impl LogViewerPanel {
     }
 
     fn rebuild_filter(&mut self) {
+        // Substring (grep) match: on log content this is far more useful than
+        // fuzzy, which would match almost any line as a scattered subsequence.
+        // Chronological order is preserved.
         let lower = self.filter.to_lowercase();
         self.filtered_indices = self
             .lines
@@ -96,7 +99,7 @@ impl LogViewerPanel {
     pub fn append_line(&mut self, line: &str) {
         let idx = self.lines.len();
         self.lines.push(line.to_string());
-        // Update filter index if line matches
+        // Update filter index if line matches (substring)
         if !self.filter.is_empty() && line.to_lowercase().contains(&self.filter.to_lowercase()) {
             self.filtered_indices.push(idx);
         }
@@ -367,7 +370,7 @@ fn iso_to_hms(token: &str) -> Option<String> {
     None
 }
 
-/// Renders a line with filter matches highlighted.
+/// Renders a line with the substring matches of `filter` highlighted.
 #[allow(clippy::too_many_arguments)]
 fn render_highlighted_line(
     buf: &mut Buffer,

@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 
 use crate::aws::Cluster;
+use crate::ui::fuzzy::fuzzy_match;
 use crate::ui::style::{styles, theme};
 
 pub struct ClustersPanel {
@@ -45,14 +46,18 @@ impl ClustersPanel {
     }
 
     fn rebuild_filter(&mut self) {
-        let lower = self.filter.to_lowercase();
-        self.filtered = self
-            .clusters
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| lower.is_empty() || c.cluster_name.to_lowercase().contains(&lower))
-            .map(|(i, _)| i)
-            .collect();
+        if self.filter.is_empty() {
+            self.filtered = (0..self.clusters.len()).collect();
+        } else {
+            let mut scored: Vec<(usize, i32)> = self
+                .clusters
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| fuzzy_match(&c.cluster_name, &self.filter).map(|s| (i, s)))
+                .collect();
+            scored.sort_by(|a, b| b.1.cmp(&a.1));
+            self.filtered = scored.into_iter().map(|(i, _)| i).collect();
+        }
         let count = self.filtered.len();
         if self.cursor >= count && count > 0 {
             self.cursor = count - 1;
@@ -163,5 +168,58 @@ impl ClustersPanel {
             ]);
             buf.set_line(inner.x, y, &line, inner.width);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cl(name: &str) -> Cluster {
+        Cluster {
+            cluster_name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn fuzzy_filter_matches_subsequence() {
+        let mut p = ClustersPanel::new();
+        p.set_clusters(vec![cl("staging-api"), cl("prod-api"), cl("prod-worker")]);
+        p.set_filter("prdapi");
+        let names: Vec<&str> = p
+            .visible()
+            .iter()
+            .map(|c| c.cluster_name.as_str())
+            .collect();
+        // only "prod-api" contains p,r,d,a,p,i in order
+        assert_eq!(names, vec!["prod-api"]);
+    }
+
+    #[test]
+    fn fuzzy_filter_ranks_better_match_first() {
+        let mut p = ClustersPanel::new();
+        p.set_clusters(vec![cl("aXpXi"), cl("api")]);
+        p.set_filter("api");
+        let names: Vec<&str> = p
+            .visible()
+            .iter()
+            .map(|c| c.cluster_name.as_str())
+            .collect();
+        // consecutive + word-boundary match ranks ahead of the spread-out one
+        assert_eq!(names.first(), Some(&"api"));
+    }
+
+    #[test]
+    fn empty_filter_keeps_all_in_order() {
+        let mut p = ClustersPanel::new();
+        p.set_clusters(vec![cl("a"), cl("b"), cl("c")]);
+        p.set_filter("");
+        let names: Vec<&str> = p
+            .visible()
+            .iter()
+            .map(|c| c.cluster_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
     }
 }
