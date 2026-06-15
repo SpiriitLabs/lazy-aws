@@ -190,23 +190,35 @@ pub fn default_hints(tab: usize) -> Vec<Hint> {
             });
             hints.push(Hint {
                 key: "s".to_string(),
-                desc: "SQL query".to_string(),
+                desc: "console".to_string(),
             });
             hints.push(Hint {
-                key: "e".to_string(),
-                desc: "execute".to_string(),
+                key: "F5".to_string(),
+                desc: "run".to_string(),
+            });
+            hints.push(Hint {
+                key: "enter".to_string(),
+                desc: "preview".to_string(),
+            });
+            hints.push(Hint {
+                key: "t".to_string(),
+                desc: "structure".to_string(),
+            });
+            hints.push(Hint {
+                key: "m".to_string(),
+                desc: "toggle console".to_string(),
+            });
+            hints.push(Hint {
+                key: "o".to_string(),
+                desc: "sort".to_string(),
+            });
+            hints.push(Hint {
+                key: "E".to_string(),
+                desc: "export".to_string(),
             });
             hints.push(Hint {
                 key: "d".to_string(),
                 desc: "disconnect".to_string(),
-            });
-            hints.push(Hint {
-                key: "E".to_string(),
-                desc: "export CSV".to_string(),
-            });
-            hints.push(Hint {
-                key: "i".to_string(),
-                desc: "import SQL".to_string(),
             });
         }
         5 => {

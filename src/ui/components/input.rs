@@ -6,11 +6,13 @@ use ratatui::widgets::{Block, Borders, Clear, Widget};
 
 use crate::ui::messages::Action;
 use crate::ui::style::theme;
+use crate::ui::text_buffer::TextBuffer;
 
-/// InputBox is a text input overlay with cursor navigation.
+/// InputBox is a single-line text input overlay. Text storage, cursor motion
+/// and word deletion are delegated to a shared [`TextBuffer`]; the InputBox
+/// owns only the overlay rendering, password masking and submit/cancel keys.
 pub struct InputBox {
-    value: Vec<char>,
-    cursor: usize, // character position in value
+    buf: TextBuffer,
     label: String,
     placeholder: String,
     visible: bool,
@@ -27,8 +29,7 @@ impl Default for InputBox {
 impl InputBox {
     pub fn new() -> Self {
         InputBox {
-            value: Vec::new(),
-            cursor: 0,
+            buf: TextBuffer::new(false),
             label: String::new(),
             placeholder: String::new(),
             visible: false,
@@ -40,8 +41,7 @@ impl InputBox {
     pub fn show(&mut self, label: &str, placeholder: &str) {
         self.label = label.to_string();
         self.placeholder = placeholder.to_string();
-        self.value.clear();
-        self.cursor = 0;
+        self.buf.clear();
         self.scroll_x = 0;
         self.visible = true;
         self.password_mode = false;
@@ -50,8 +50,7 @@ impl InputBox {
     pub fn show_with_value(&mut self, label: &str, placeholder: &str, initial: &str) {
         self.label = label.to_string();
         self.placeholder = placeholder.to_string();
-        self.value = initial.chars().collect();
-        self.cursor = self.value.len();
+        self.buf.set_text(initial);
         self.scroll_x = 0;
         self.visible = true;
         self.password_mode = false;
@@ -71,13 +70,22 @@ impl InputBox {
     }
 
     pub fn value(&self) -> String {
-        self.value.iter().collect()
+        self.buf.text()
+    }
+
+    fn cursor(&self) -> usize {
+        self.buf.cursor().1
+    }
+
+    fn chars(&self) -> Vec<char> {
+        self.buf.line(0).map(|l| l.to_vec()).unwrap_or_default()
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
         if !self.visible {
             return None;
         }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
         match key.code {
             KeyCode::Enter => {
@@ -90,100 +98,56 @@ impl InputBox {
                 Some(Action::InputCancel)
             }
             // Ctrl+H (Ctrl+Backspace on most terminals) / Ctrl+W: delete previous word
-            KeyCode::Char('h' | 'w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let target = self.prev_word_boundary();
-                self.value.drain(target..self.cursor);
-                self.cursor = target;
+            KeyCode::Char('h' | 'w') if ctrl => {
+                self.buf.delete_prev_word();
                 None
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.value.insert(self.cursor, c);
-                self.cursor += 1;
+            KeyCode::Char(c) if !ctrl => {
+                self.buf.insert_char(c);
                 None
             }
             KeyCode::Backspace => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) {
-                    // Delete previous word
-                    let target = self.prev_word_boundary();
-                    self.value.drain(target..self.cursor);
-                    self.cursor = target;
-                } else if self.cursor > 0 {
-                    self.cursor -= 1;
-                    self.value.remove(self.cursor);
+                if ctrl {
+                    self.buf.delete_prev_word();
+                } else {
+                    self.buf.backspace();
                 }
                 None
             }
             KeyCode::Delete => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) {
-                    // Delete next word
-                    let target = self.next_word_boundary();
-                    self.value.drain(self.cursor..target);
-                } else if self.cursor < self.value.len() {
-                    self.value.remove(self.cursor);
+                if ctrl {
+                    self.buf.delete_next_word();
+                } else {
+                    self.buf.delete();
                 }
                 None
             }
             KeyCode::Left => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) {
-                    // Jump to previous word boundary
-                    self.cursor = self.prev_word_boundary();
-                } else if self.cursor > 0 {
-                    self.cursor -= 1;
+                if ctrl {
+                    self.buf.word_left();
+                } else {
+                    self.buf.move_left();
                 }
                 None
             }
             KeyCode::Right => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) {
-                    // Jump to next word boundary
-                    self.cursor = self.next_word_boundary();
-                } else if self.cursor < self.value.len() {
-                    self.cursor += 1;
+                if ctrl {
+                    self.buf.word_right();
+                } else {
+                    self.buf.move_right();
                 }
                 None
             }
             KeyCode::Home => {
-                self.cursor = 0;
+                self.buf.home();
                 None
             }
             KeyCode::End => {
-                self.cursor = self.value.len();
+                self.buf.end();
                 None
             }
             _ => None,
         }
-    }
-
-    fn prev_word_boundary(&self) -> usize {
-        if self.cursor == 0 {
-            return 0;
-        }
-        let mut pos = self.cursor - 1;
-        // Skip spaces
-        while pos > 0 && self.value[pos] == ' ' {
-            pos -= 1;
-        }
-        // Skip word chars
-        while pos > 0 && self.value[pos - 1] != ' ' {
-            pos -= 1;
-        }
-        pos
-    }
-
-    fn next_word_boundary(&self) -> usize {
-        let len = self.value.len();
-        if self.cursor >= len {
-            return len;
-        }
-        let mut pos = self.cursor;
-        // Skip current word chars
-        while pos < len && self.value[pos] != ' ' {
-            pos += 1;
-        }
-        // Skip spaces
-        while pos < len && self.value[pos] == ' ' {
-            pos += 1;
-        }
-        pos
     }
 
     /// Renders the input box directly into the buffer.
@@ -223,8 +187,11 @@ impl InputBox {
             hint_style,
         );
 
+        let value: Vec<char> = self.chars();
+        let cursor = self.cursor();
+
         // Show placeholder or value
-        if self.value.is_empty() {
+        if value.is_empty() {
             let placeholder_style = Style::default().fg(theme::color_muted());
             buf.set_string(inner.x + 1, y_field, &self.placeholder, placeholder_style);
             // Cursor at start
@@ -236,10 +203,10 @@ impl InputBox {
         }
 
         // Adjust scroll to keep cursor visible
-        let scroll = if self.cursor < self.scroll_x {
-            self.cursor
-        } else if self.cursor >= self.scroll_x + field_w {
-            self.cursor - field_w + 1
+        let scroll = if cursor < self.scroll_x {
+            cursor
+        } else if cursor >= self.scroll_x + field_w {
+            cursor - field_w + 1
         } else {
             self.scroll_x
         };
@@ -250,13 +217,7 @@ impl InputBox {
             .fg(theme::color_background())
             .bg(theme::color_primary());
 
-        let visible_chars: Vec<char> = self
-            .value
-            .iter()
-            .skip(scroll)
-            .take(field_w)
-            .copied()
-            .collect();
+        let visible_chars: Vec<char> = value.iter().skip(scroll).take(field_w).copied().collect();
 
         // Draw input field background
         let field_bg = Style::default()
@@ -270,7 +231,7 @@ impl InputBox {
             let abs_pos = i + scroll;
             let x = inner.x + 1 + i as u16;
             let display_ch = if self.password_mode { '*' } else { ch };
-            if abs_pos == self.cursor {
+            if abs_pos == cursor {
                 buf.set_string(x, y_field, display_ch.to_string(), cursor_style);
             } else {
                 buf.set_string(
@@ -283,13 +244,13 @@ impl InputBox {
         }
 
         // Draw cursor at end if it's past the last char
-        if self.cursor >= scroll + visible_chars.len() && self.cursor == self.value.len() {
-            let x = inner.x + 1 + (self.cursor - scroll).min(field_w.saturating_sub(1)) as u16;
+        if cursor >= scroll + visible_chars.len() && cursor == value.len() {
+            let x = inner.x + 1 + (cursor - scroll).min(field_w.saturating_sub(1)) as u16;
             buf.set_string(x, y_field, " ", cursor_style);
         }
 
         // Position indicator
-        let pos_text = format!(" {}/{} ", self.cursor, self.value.len());
+        let pos_text = format!(" {}/{} ", cursor, value.len());
         let pos_style = Style::default().fg(theme::color_muted());
         let pos_x = inner.x + inner.width.saturating_sub(pos_text.len() as u16 + 1);
         buf.set_string(pos_x, y_label, &pos_text, pos_style);
@@ -330,7 +291,7 @@ mod tests {
         let mut b = InputBox::new();
         b.show_with_value("Query", "", "fields @timestamp");
         assert_eq!(b.value(), "fields @timestamp");
-        assert_eq!(b.cursor, 17); // cursor at end
+        assert_eq!(b.cursor(), 17); // cursor at end
     }
 
     #[test]
@@ -348,19 +309,19 @@ mod tests {
     fn cursor_navigation() {
         let mut b = InputBox::new();
         b.show_with_value("Test", "", "hello world");
-        assert_eq!(b.cursor, 11);
+        assert_eq!(b.cursor(), 11);
 
         b.handle_key(key(KeyCode::Home));
-        assert_eq!(b.cursor, 0);
+        assert_eq!(b.cursor(), 0);
 
         b.handle_key(key(KeyCode::End));
-        assert_eq!(b.cursor, 11);
+        assert_eq!(b.cursor(), 11);
 
         b.handle_key(key(KeyCode::Left));
-        assert_eq!(b.cursor, 10);
+        assert_eq!(b.cursor(), 10);
 
         b.handle_key(key(KeyCode::Right));
-        assert_eq!(b.cursor, 11);
+        assert_eq!(b.cursor(), 11);
     }
 
     #[test]
@@ -371,7 +332,7 @@ mod tests {
         b.handle_key(key(KeyCode::Right)); // after 'h'
         b.handle_key(key(KeyCode::Char('e')));
         assert_eq!(b.value(), "hello");
-        assert_eq!(b.cursor, 2);
+        assert_eq!(b.cursor(), 2);
     }
 
     #[test]
@@ -392,6 +353,6 @@ mod tests {
         b.handle_key(key(KeyCode::Right)); // cursor at 2
         b.handle_key(key(KeyCode::Backspace)); // delete 'e'
         assert_eq!(b.value(), "hllo");
-        assert_eq!(b.cursor, 1);
+        assert_eq!(b.cursor(), 1);
     }
 }

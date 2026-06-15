@@ -3,6 +3,25 @@ use ratatui::text::{Line, Span};
 
 use super::style::styles;
 
+/// Truncate `s` to at most `max` characters (not bytes), appending `…` when cut.
+///
+/// UTF-8 safe: slicing by byte offset (`&s[..n]`) panics when `n` lands inside a
+/// multibyte character. This counts `char`s instead, so it never panics.
+pub fn truncate_chars(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let char_count = s.chars().count();
+    if char_count <= max {
+        return s.to_string();
+    }
+    // Reserve one column for the ellipsis marker.
+    let keep = max.saturating_sub(1).max(1);
+    let mut out: String = s.chars().take(keep).collect();
+    out.push('…');
+    out
+}
+
 /// Render a labeled field with automatic word-wrapping.
 pub fn wrap_field<'a>(
     label: &'a str,
@@ -84,5 +103,29 @@ mod tests {
     fn zero_width_no_panic() {
         let lines = wrap_field("Label:", "value", Style::default(), 0);
         assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn truncate_shorter_than_max_unchanged() {
+        assert_eq!(truncate_chars("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_adds_ellipsis() {
+        assert_eq!(truncate_chars("hello world", 5), "hell…");
+    }
+
+    #[test]
+    fn truncate_multibyte_does_not_panic() {
+        // Each "é" is two bytes; a byte slice at 3 would split a char and panic.
+        let s = "ééééé";
+        let out = truncate_chars(s, 3);
+        assert_eq!(out.chars().count(), 3);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_zero_is_empty() {
+        assert_eq!(truncate_chars("hello", 0), "");
     }
 }

@@ -295,11 +295,55 @@ fn help_sections() -> Vec<HelpSection> {
                 },
                 Hint {
                     key: "s".to_string(),
-                    desc: "run SQL query".to_string(),
+                    desc: "focus SQL console (multi-line scripts)".to_string(),
+                },
+                Hint {
+                    key: "F5 / Alt+↵ / Ctrl+r".to_string(),
+                    desc: "run statement under cursor (console)".to_string(),
+                },
+                Hint {
+                    key: "Ctrl+s/o".to_string(),
+                    desc: "save / open .sql script (console)".to_string(),
+                },
+                Hint {
+                    key: "Ctrl+↑↓".to_string(),
+                    desc: "resize console / grid split".to_string(),
+                },
+                Hint {
+                    key: "m".to_string(),
+                    desc: "toggle console visibility".to_string(),
                 },
                 Hint {
                     key: "e".to_string(),
-                    desc: "execute modify query (INSERT/UPDATE/DELETE/DDL)".to_string(),
+                    desc: "quick modify query (INSERT/UPDATE/DELETE/DDL)".to_string(),
+                },
+                Hint {
+                    key: "enter".to_string(),
+                    desc: "preview selected table (SELECT *)".to_string(),
+                },
+                Hint {
+                    key: "t".to_string(),
+                    desc: "show table structure (columns/types/keys)".to_string(),
+                },
+                Hint {
+                    key: "o".to_string(),
+                    desc: "sort grid by current column".to_string(),
+                },
+                Hint {
+                    key: "x / X / f".to_string(),
+                    desc: "hide / unhide-all / freeze column".to_string(),
+                },
+                Hint {
+                    key: "tab".to_string(),
+                    desc: "autocomplete in console".to_string(),
+                },
+                Hint {
+                    key: "v / shift+arrows".to_string(),
+                    desc: "select cells (range)".to_string(),
+                },
+                Hint {
+                    key: "y / Y".to_string(),
+                    desc: "copy cell-or-selection (TSV) / row".to_string(),
                 },
                 Hint {
                     key: "d".to_string(),
@@ -310,12 +354,8 @@ fn help_sections() -> Vec<HelpSection> {
                     desc: "SQL query history".to_string(),
                 },
                 Hint {
-                    key: "enter".to_string(),
-                    desc: "SELECT * from selected table".to_string(),
-                },
-                Hint {
                     key: "E".to_string(),
-                    desc: "export query results to CSV".to_string(),
+                    desc: "export results (.csv/.json)".to_string(),
                 },
                 Hint {
                     key: "i".to_string(),

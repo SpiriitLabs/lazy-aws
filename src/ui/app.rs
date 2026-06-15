@@ -70,6 +70,8 @@ enum BgMsg {
     RdsConnectionError(String),
     RdsTablesLoaded(Vec<String>),
     RdsTablesError(String),
+    QueryStarted(u32),
+    ColumnsLoaded(Vec<(String, String)>),
     QueryResult {
         columns: Vec<String>,
         rows: Vec<Vec<String>>,
@@ -135,6 +137,7 @@ enum InputMode {
     RdsDatabase,
     SqlQuery,
     SqlModify,
+    SaveSqlFilename,
     ExportQueryResults,
     ImportSql,
     S3Upload,
@@ -234,7 +237,8 @@ pub struct App {
     terminal: panels::TerminalPanel,
     rds_instances: panels::RdsInstancesPanel,
     rds_tables: panels::RdsTablesPanel,
-    query_results: panels::QueryResultsPanel,
+    query_results: panels::DataGridPanel,
+    sql_editor: SqlEditor,
     buckets: panels::BucketsPanel,
     objects: panels::ObjectsPanel,
 
@@ -244,7 +248,18 @@ pub struct App {
     choice: ChoiceDialog,
     help: HelpPopup,
     input: InputBox,
+    file_browser: FileBrowser,
     spinner: LoadingSpinner,
+
+    // RDS console (SQL editor) state
+    console_visible: bool,
+    split_rds_console: u16, // console height percentage of the right area (20..80)
+    launch_dir: std::path::PathBuf,
+    pending_save_dir: Option<std::path::PathBuf>,
+    query_pid: Option<u32>, // pid of the running mysql query (for cancellation)
+    query_cancelled: bool,
+    /// Column names per table for SQL autocompletion (lazy-loaded on connect).
+    table_columns: std::collections::HashMap<String, Vec<String>>,
 
     // State
     active_tab: usize,
@@ -341,6 +356,11 @@ pub struct App {
     hit_top_panel: Rect,
     hit_bottom_panel: Rect,
     hit_right_panel: Rect,
+    hit_console: Rect,
+
+    // Mouse drag / double-click tracking for the data grid
+    grid_dragging: bool,
+    last_grid_click: Option<(u16, u16, std::time::Instant)>,
 
     // Layout adaptation
     layout_mode_override: Option<LayoutMode>,
@@ -373,7 +393,8 @@ impl App {
             terminal: panels::TerminalPanel::new(),
             rds_instances: panels::RdsInstancesPanel::new(),
             rds_tables: panels::RdsTablesPanel::new(),
-            query_results: panels::QueryResultsPanel::new(),
+            query_results: panels::DataGridPanel::new(),
+            sql_editor: SqlEditor::new(),
             buckets: panels::BucketsPanel::new(),
             objects: panels::ObjectsPanel::new(),
             _status_bar: StatusBar::new(),
@@ -381,7 +402,15 @@ impl App {
             choice: ChoiceDialog::new(),
             help: HelpPopup::new(),
             input: InputBox::new(),
+            file_browser: FileBrowser::new(),
             spinner: LoadingSpinner::new(),
+            console_visible: true,
+            split_rds_console: 35,
+            launch_dir: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            pending_save_dir: None,
+            query_pid: None,
+            query_cancelled: false,
+            table_columns: std::collections::HashMap::new(),
             active_tab: TAB_ECS,
             active_panel: 0,
             split_horizontal: 50,
@@ -450,6 +479,9 @@ impl App {
             hit_top_panel: Rect::default(),
             hit_bottom_panel: Rect::default(),
             hit_right_panel: Rect::default(),
+            hit_console: Rect::default(),
+            grid_dragging: false,
+            last_grid_click: None,
             layout_mode_override: None,
             resize_mode: ResizeMode::Inactive,
         }
@@ -735,11 +767,22 @@ impl App {
                     self.loading_rds_tables = false;
                     self.rds_tables.set_tables(tables);
                     self.spinner.stop();
+                    // Warm the column cache for autocompletion (best-effort).
+                    self.spawn_load_columns();
+                }
+                BgMsg::ColumnsLoaded(pairs) => {
+                    self.table_columns.clear();
+                    for (table, column) in pairs {
+                        self.table_columns.entry(table).or_default().push(column);
+                    }
                 }
                 BgMsg::RdsTablesError(e) => {
                     self.loading_rds_tables = false;
                     self.set_error(format!("Failed to load tables: {e}"));
                     self.spinner.stop();
+                }
+                BgMsg::QueryStarted(pid) => {
+                    self.query_pid = Some(pid);
                 }
                 BgMsg::QueryResult {
                     columns,
@@ -748,6 +791,7 @@ impl App {
                     query,
                 } => {
                     self.loading_query = false;
+                    self.query_pid = None;
                     self.query_results
                         .set_results(columns, rows, query, duration_ms);
                     self.spinner.stop();
@@ -760,9 +804,16 @@ impl App {
                 }
                 BgMsg::QueryError(e) => {
                     self.loading_query = false;
-                    self.query_results.set_error(e);
+                    self.query_pid = None;
                     self.spinner.stop();
                     self.active_panel = 2;
+                    if self.query_cancelled {
+                        // The error is just mysql dying from our kill; report calmly.
+                        self.query_cancelled = false;
+                        self.set_info("Query cancelled".to_string());
+                    } else {
+                        self.query_results.set_error(e);
+                    }
                     if self.pending_dml_refresh {
                         self.pending_dml_refresh = false;
                     }
@@ -1032,6 +1083,122 @@ impl App {
             return false;
         }
 
+        // 4b. File browser modal (open/save .sql scripts)
+        if self.file_browser.is_visible() {
+            let outcome = self.file_browser.handle_key(key);
+            self.handle_browser_outcome(outcome);
+            return false;
+        }
+
+        // 4b-bis. Cancel a running query with Esc (kills the mysql process).
+        if self.active_tab == TAB_RDS
+            && self.loading_query
+            && key.code == KeyCode::Esc
+            && self.query_pid.is_some()
+        {
+            if let Some(pid) = self.query_pid.take() {
+                self.query_cancelled = true;
+                kill_process(pid);
+            }
+            return false;
+        }
+
+        // 4c. SQL console edit focus — capture all typing before global keys so
+        //     letters/digits insert text instead of triggering shortcuts.
+        if self.active_tab == TAB_RDS
+            && self.active_panel == 3
+            && self.console_visible
+            && self.rds_connection.is_some()
+        {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+            // When the completion popup is open it owns the navigation keys —
+            // except modified Enter, which still runs the query.
+            if self.sql_editor.completion_active() {
+                match key.code {
+                    KeyCode::Tab | KeyCode::Down => {
+                        self.sql_editor.completion_next();
+                        return false;
+                    }
+                    KeyCode::Up => {
+                        self.sql_editor.completion_prev();
+                        return false;
+                    }
+                    KeyCode::Enter | KeyCode::Right if !ctrl && !alt => {
+                        self.sql_editor.accept_completion();
+                        return false;
+                    }
+                    KeyCode::Esc => {
+                        self.sql_editor.cancel_completion();
+                        return false;
+                    }
+                    _ => {
+                        // Any other key dismisses the popup and is handled below.
+                        self.sql_editor.cancel_completion();
+                    }
+                }
+            }
+
+            match key.code {
+                KeyCode::Esc => {
+                    self.active_panel = 2;
+                    return false;
+                }
+                // Run the current statement. Ctrl+Enter is unreliable across
+                // terminals (often sent as a plain Enter), so F5, Ctrl+R and
+                // Alt+Enter are provided as dependable alternatives.
+                KeyCode::F(5) => {
+                    self.execute_console_statement();
+                    return false;
+                }
+                KeyCode::Enter if ctrl || alt => {
+                    self.execute_console_statement();
+                    return false;
+                }
+                KeyCode::Char('r') if ctrl => {
+                    self.execute_console_statement();
+                    return false;
+                }
+                KeyCode::Char('s') if ctrl => {
+                    self.open_console_file(BrowserMode::Save);
+                    return false;
+                }
+                KeyCode::Char('o') if ctrl => {
+                    self.open_console_file(BrowserMode::Open);
+                    return false;
+                }
+                KeyCode::Tab => {
+                    self.open_console_completion();
+                    return false;
+                }
+                KeyCode::Up if ctrl => {
+                    self.resize_console(true);
+                    return false;
+                }
+                KeyCode::Down if ctrl => {
+                    self.resize_console(false);
+                    return false;
+                }
+                _ => {
+                    if self.sql_editor.handle_edit_key(key) {
+                        // As-you-type: refresh the completion popup after edits
+                        // that change the word under the cursor.
+                        match key.code {
+                            KeyCode::Char(c) if c.is_alphanumeric() || c == '_' || c == '.' => {
+                                self.refresh_console_completion();
+                            }
+                            KeyCode::Backspace | KeyCode::Delete => {
+                                self.refresh_console_completion();
+                            }
+                            _ => {}
+                        }
+                        return false;
+                    }
+                }
+            }
+        }
+
         // 5. Streaming output — Ctrl+C kills, Esc hides
         if self.stream_rx.is_some() {
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -1204,15 +1371,145 @@ impl App {
             }
         }
 
-        // Query results navigation (when focused on query results, panel 2 in RDS tab)
+        // Query results / data grid (panel 2 in RDS tab)
         if self.active_tab == TAB_RDS && self.active_panel == 2 {
+            // Modal value viewer takes precedence over everything else.
+            if self.query_results.value_viewer_active() {
+                match key.code {
+                    KeyCode::Esc => self.query_results.close_value_viewer(),
+                    KeyCode::Char('j') | KeyCode::Down => self.query_results.value_scroll_down(),
+                    KeyCode::Char('k') | KeyCode::Up => self.query_results.value_scroll_up(),
+                    KeyCode::Char('y') => {
+                        if let Some(t) = self.query_results.current_value_text() {
+                            let _ = crate::ui::clipboard::copy(&t);
+                            self.set_info("Copied value".to_string());
+                        }
+                    }
+                    _ => {}
+                }
+                return false;
+            }
+
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
             match key.code {
-                KeyCode::Char('h') | KeyCode::Left => {
-                    self.query_results.scroll_left();
+                KeyCode::Left => {
+                    if shift {
+                        self.query_results.extend_left();
+                    } else {
+                        self.query_results.move_left();
+                    }
                     return false;
                 }
-                KeyCode::Char('l') | KeyCode::Right => {
-                    self.query_results.scroll_right();
+                KeyCode::Right => {
+                    if shift {
+                        self.query_results.extend_right();
+                    } else {
+                        self.query_results.move_right();
+                    }
+                    return false;
+                }
+                KeyCode::Up => {
+                    if shift {
+                        self.query_results.extend_up();
+                    } else {
+                        self.query_results.move_up();
+                    }
+                    return false;
+                }
+                KeyCode::Down => {
+                    if shift {
+                        self.query_results.extend_down();
+                    } else {
+                        self.query_results.move_down();
+                    }
+                    return false;
+                }
+                KeyCode::Char('h') => {
+                    self.query_results.move_left();
+                    return false;
+                }
+                KeyCode::Char('l') => {
+                    self.query_results.move_right();
+                    return false;
+                }
+                KeyCode::Char('j') => {
+                    self.query_results.move_down();
+                    return false;
+                }
+                KeyCode::Char('k') => {
+                    self.query_results.move_up();
+                    return false;
+                }
+                KeyCode::Char('H') => {
+                    self.query_results.extend_left();
+                    return false;
+                }
+                KeyCode::Char('L') => {
+                    self.query_results.extend_right();
+                    return false;
+                }
+                KeyCode::Char('J') => {
+                    self.query_results.extend_down();
+                    return false;
+                }
+                KeyCode::Char('K') => {
+                    self.query_results.extend_up();
+                    return false;
+                }
+                KeyCode::Char('g') => {
+                    self.query_results.go_top();
+                    return false;
+                }
+                KeyCode::Char('G') => {
+                    self.query_results.go_bottom();
+                    return false;
+                }
+                KeyCode::Char('o') => {
+                    self.query_results.sort_current_column();
+                    return false;
+                }
+                KeyCode::Char('x') => {
+                    self.query_results.hide_current_column();
+                    return false;
+                }
+                KeyCode::Char('X') => {
+                    self.query_results.unhide_all_columns();
+                    return false;
+                }
+                KeyCode::Char('f') => {
+                    self.query_results.toggle_freeze_first_column();
+                    return false;
+                }
+                KeyCode::Char('v') => {
+                    self.query_results.toggle_visual();
+                    return false;
+                }
+                KeyCode::Esc => {
+                    self.query_results.clear_selection();
+                    return false;
+                }
+                KeyCode::Enter => {
+                    self.query_results.open_value_viewer();
+                    return false;
+                }
+                KeyCode::Char('y') => {
+                    let text = self.query_results.copy_text();
+                    if !text.is_empty() {
+                        match crate::ui::clipboard::copy(&text) {
+                            Ok(()) => self.set_info("Copied selection".to_string()),
+                            Err(e) => self.set_error(format!("Copy failed: {e}")),
+                        }
+                    }
+                    return false;
+                }
+                KeyCode::Char('Y') => {
+                    let text = self.query_results.copy_rows_text();
+                    if !text.is_empty() {
+                        match crate::ui::clipboard::copy(&text) {
+                            Ok(()) => self.set_info("Copied row(s)".to_string()),
+                            Err(e) => self.set_error(format!("Copy failed: {e}")),
+                        }
+                    }
                     return false;
                 }
                 _ => {}
@@ -1384,17 +1681,31 @@ impl App {
                         self.rds_connection = None;
                         self.rds_tables.set_tables(vec![]);
                         self.query_results.clear();
+                        self.sql_editor.clear();
+                        self.table_columns.clear();
                         self.kill_ssm_tunnel();
                         self.set_info("Disconnected".to_string());
                     }
                     return false;
                 }
-                // s = SQL query
+                // s = focus the SQL console (multi-line scripts)
                 if key.code == KeyCode::Char('s') {
                     if self.rds_connection.is_some() {
-                        self.show_sql_query_input();
+                        self.focus_console();
                     } else {
                         self.set_error("Not connected. Press c to connect.".to_string());
+                    }
+                    return false;
+                }
+                // m = toggle the SQL console visibility
+                if key.code == KeyCode::Char('m') && self.rds_connection.is_some() {
+                    self.toggle_console();
+                    return false;
+                }
+                // t = show the structure (columns/types/keys) of the selected table
+                if key.code == KeyCode::Char('t') && self.rds_connection.is_some() {
+                    if let Some(table) = self.rds_tables.selected().cloned() {
+                        self.spawn_execute_query(&format!("SHOW FULL COLUMNS FROM `{table}`"));
                     }
                     return false;
                 }
@@ -1587,6 +1898,19 @@ impl App {
                                     .show(&format!("Execute modification query?\n\n{}", truncated));
                                 self.pending_action =
                                     Some(PendingAction::ExecuteDmlQuery { sql: value });
+                            }
+                        }
+                    }
+                    InputMode::SaveSqlFilename => {
+                        self.input_mode = InputMode::None;
+                        if let Some(dir) = self.pending_save_dir.take() {
+                            if !value.is_empty() {
+                                let name = if value.ends_with(".sql") {
+                                    value
+                                } else {
+                                    format!("{value}.sql")
+                                };
+                                self.write_sql_file(&dir.join(name));
                             }
                         }
                     }
@@ -2066,6 +2390,50 @@ impl App {
                     return;
                 }
 
+                // SQL console click → focus it.
+                if self.active_tab == TAB_RDS
+                    && self.console_visible
+                    && self.rds_connection.is_some()
+                    && self.is_in_rect(col, row, self.hit_console)
+                {
+                    self.active_panel = 3;
+                    return;
+                }
+
+                // Data grid: header click sorts, cell click starts a selection,
+                // double-click opens the value viewer.
+                if self.active_tab == TAB_RDS
+                    && self.rds_connection.is_some()
+                    && self.is_in_rect(col, row, self.hit_right_panel)
+                {
+                    self.active_panel = 2;
+                    if self.query_results.value_viewer_active() {
+                        self.query_results.close_value_viewer();
+                        return;
+                    }
+                    if let Some(c) = self.query_results.header_at(col, row) {
+                        self.query_results.sort_column(c);
+                        return;
+                    }
+                    if let Some((r, c)) = self.query_results.cell_at(col, row) {
+                        let now = std::time::Instant::now();
+                        let is_double = self.last_grid_click.is_some_and(|(lc, lr, t)| {
+                            lc == col && lr == row && now.duration_since(t).as_millis() < 400
+                        });
+                        if is_double {
+                            self.query_results.set_cursor_cell(r, c);
+                            self.query_results.open_value_viewer();
+                            self.last_grid_click = None;
+                            self.grid_dragging = false;
+                        } else {
+                            self.query_results.begin_selection(r, c);
+                            self.grid_dragging = true;
+                            self.last_grid_click = Some((col, row, now));
+                        }
+                    }
+                    return;
+                }
+
                 // Panel focus on click
                 if self.is_in_rect(col, row, self.hit_top_panel) {
                     self.active_panel = 0;
@@ -2079,8 +2447,22 @@ impl App {
                     self.active_panel = 2;
                 }
             }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.grid_dragging {
+                    if let Some((r, c)) = self.query_results.cell_at(col, row) {
+                        self.query_results.drag_selection(r, c);
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.grid_dragging = false;
+            }
             MouseEventKind::ScrollUp => {
-                if self.is_in_rect(col, row, self.hit_top_panel) {
+                // Shift+wheel over the data grid scrolls horizontally.
+                if mouse.modifiers.contains(KeyModifiers::SHIFT) && self.grid_under(col, row) {
+                    self.active_panel = 2;
+                    self.query_results.move_left();
+                } else if self.is_in_rect(col, row, self.hit_top_panel) {
                     self.active_panel = 0;
                     self.navigate_up();
                 } else if self.is_in_rect(col, row, self.hit_bottom_panel) {
@@ -2096,7 +2478,10 @@ impl App {
                 }
             }
             MouseEventKind::ScrollDown => {
-                if self.is_in_rect(col, row, self.hit_top_panel) {
+                if mouse.modifiers.contains(KeyModifiers::SHIFT) && self.grid_under(col, row) {
+                    self.active_panel = 2;
+                    self.query_results.move_right();
+                } else if self.is_in_rect(col, row, self.hit_top_panel) {
                     self.active_panel = 0;
                     self.navigate_down();
                 } else if self.is_in_rect(col, row, self.hit_bottom_panel) {
@@ -2111,8 +2496,28 @@ impl App {
                     self.navigate_down();
                 }
             }
+            // Native horizontal wheel (trackpads / tilt wheels).
+            MouseEventKind::ScrollLeft => {
+                if self.grid_under(col, row) {
+                    self.active_panel = 2;
+                    self.query_results.move_left();
+                }
+            }
+            MouseEventKind::ScrollRight => {
+                if self.grid_under(col, row) {
+                    self.active_panel = 2;
+                    self.query_results.move_right();
+                }
+            }
             _ => {}
         }
+    }
+
+    /// True when the data grid (RDS results) is under the given screen cell.
+    fn grid_under(&self, col: u16, row: u16) -> bool {
+        self.active_tab == TAB_RDS
+            && self.rds_connection.is_some()
+            && self.is_in_rect(col, row, self.hit_right_panel)
     }
 
     fn is_in_rect(&self, col: u16, row: u16, rect: Rect) -> bool {
@@ -2336,12 +2741,37 @@ impl App {
                     self.loading_rds_tables,
                 );
                 if self.rds_connection.is_some() {
-                    self.query_results.render(
-                        right_area,
-                        f.buffer_mut(),
-                        self.active_panel == 2,
-                        self.loading_query,
-                    );
+                    if self.console_visible {
+                        // Split right area: SQL console (top) + data grid (bottom).
+                        let rds_right = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([
+                                Constraint::Percentage(self.split_rds_console),
+                                Constraint::Percentage(100 - self.split_rds_console),
+                            ])
+                            .split(right_area);
+                        self.hit_console = rds_right[0];
+                        self.hit_right_panel = rds_right[1];
+                        self.sql_editor.render(
+                            rds_right[0],
+                            f.buffer_mut(),
+                            self.active_panel == 3,
+                        );
+                        self.query_results.render(
+                            rds_right[1],
+                            f.buffer_mut(),
+                            self.active_panel == 2,
+                            self.loading_query,
+                        );
+                    } else {
+                        self.hit_console = Rect::default();
+                        self.query_results.render(
+                            right_area,
+                            f.buffer_mut(),
+                            self.active_panel == 2,
+                            self.loading_query,
+                        );
+                    }
                 } else {
                     if let Some(inst) = self.rds_instances.selected() {
                         self.detail.set_lines(format_rds_instance_detail(inst));
@@ -2454,10 +2884,12 @@ impl App {
         if self.layout.mode == LayoutMode::Vertical {
             match self.active_tab {
                 TAB_SSM => 2, // Instances + Detail (skip empty Sessions block)
-                _ => 3,       // top + bottom + detail/right
+                TAB_RDS if self.rds_connection.is_some() && self.console_visible => 4,
+                _ => 3, // top + bottom + detail/right
             }
         } else {
             match self.active_tab {
+                TAB_RDS if self.rds_connection.is_some() && self.console_visible => 4,
                 TAB_LOGS | TAB_RDS => 3,
                 _ => 2,
             }
@@ -2558,6 +2990,11 @@ impl App {
                 if self.rds_connection.is_some() {
                     self.query_results
                         .render(rects[2], buf, active == 2, self.loading_query);
+                    if self.console_visible {
+                        if let Some(&console_rect) = rects.get(3) {
+                            self.sql_editor.render(console_rect, buf, active == 3);
+                        }
+                    }
                 } else {
                     if let Some(inst) = self.rds_instances.selected() {
                         self.detail.set_lines(format_rds_instance_detail(inst));
@@ -2723,6 +3160,11 @@ impl App {
     }
 
     fn render_overlays(&mut self, size: Rect, f: &mut ratatui::Frame) {
+        if self.file_browser.is_visible() {
+            let popup_area = centered_rect(60, 70, size);
+            self.file_browser.render(popup_area, f.buffer_mut());
+        }
+
         if self.help.is_visible() {
             let popup_area = centered_rect(60, 80, size);
             self.help.render(popup_area, f.buffer_mut());
@@ -2848,7 +3290,7 @@ impl App {
             TAB_RDS => match self.active_panel {
                 0 => self.rds_instances.filter.clone(),
                 1 => self.rds_tables.filter.clone(),
-                2 => self.query_results.filter.clone(),
+                2 => self.query_results.filter().to_string(),
                 _ => String::new(),
             },
             TAB_S3 => {
@@ -3011,7 +3453,7 @@ impl App {
         };
 
         if let Some(text) = text {
-            match copy_to_clipboard(&text) {
+            match crate::ui::clipboard::copy(&text) {
                 Ok(()) => {
                     let preview = if text.len() > 60 {
                         format!("{}...", &text[..60])
@@ -3355,7 +3797,7 @@ impl App {
     }
 
     fn handle_export_query_results(&mut self) {
-        if self.query_results.columns.is_empty() {
+        if self.query_results.is_empty() {
             self.set_error("No query results to export".to_string());
             return;
         }
@@ -3364,7 +3806,10 @@ impl App {
         let default_path = format!("{home}/lazy-aws-query-{timestamp}.csv");
         self.input_mode = InputMode::ExportQueryResults;
         self.input.show_with_value(
-            &format!("Export {} rows to CSV", self.query_results.rows.len()),
+            &format!(
+                "Export {} rows (.csv/.json)",
+                self.query_results.total_rows()
+            ),
             "file path...",
             &default_path,
         );
@@ -3373,7 +3818,7 @@ impl App {
     fn export_query_results_to_file(&mut self, path: &str) {
         use std::io::Write;
 
-        if self.query_results.columns.is_empty() {
+        if self.query_results.is_empty() {
             self.set_error("No query results to export".to_string());
             return;
         }
@@ -3385,40 +3830,19 @@ impl App {
             path.to_string()
         };
 
-        let mut csv = String::new();
-
-        // Header row
-        let header: Vec<String> = self
-            .query_results
-            .columns
-            .iter()
-            .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
-            .collect();
-        csv.push_str(&header.join(","));
-        csv.push('\n');
-
-        // Data rows
-        for row in &self.query_results.rows {
-            let cells: Vec<String> = row
-                .iter()
-                .map(|cell| format!("\"{}\"", cell.replace('"', "\"\"")))
-                .collect();
-            csv.push_str(&cells.join(","));
-            csv.push('\n');
-        }
+        // Pick the serializer from the file extension (CSV by default).
+        let content = if expanded.to_lowercase().ends_with(".json") {
+            self.query_results.to_json()
+        } else {
+            self.query_results.to_csv()
+        };
+        let row_count = self.query_results.total_rows();
 
         match std::fs::File::create(&expanded) {
-            Ok(mut file) => match file.write_all(csv.as_bytes()) {
+            Ok(mut file) => match file.write_all(content.as_bytes()) {
                 Ok(()) => {
-                    self.set_info(format!(
-                        "Exported {} rows to {}",
-                        self.query_results.rows.len(),
-                        path
-                    ));
-                    log::info!(
-                        "exported {} rows to {expanded}",
-                        self.query_results.rows.len()
-                    );
+                    self.set_info(format!("Exported {row_count} rows to {path}"));
+                    log::info!("exported {row_count} rows to {expanded}");
                 }
                 Err(e) => {
                     self.set_error(format!("Write error: {e}"));
@@ -4082,6 +4506,12 @@ impl App {
             self.set_error("No SSM-managed instances found in this region".to_string());
             return;
         }
+        // With a single bastion available there is nothing to choose — use it.
+        if self.tunnel_ssm_instances.len() == 1 {
+            let target = self.tunnel_ssm_instances[0].id.clone();
+            self.open_ssm_tunnel(&target);
+            return;
+        }
         let choices: Vec<Choice> = self
             .tunnel_ssm_instances
             .iter()
@@ -4333,7 +4763,8 @@ impl App {
         let user = conn.user.clone();
         let password = conn.password.clone();
         let database = conn.database.clone();
-        let sql = sql.to_string();
+        // Guard against unbounded result sets: bare SELECTs get a default LIMIT.
+        let sql = with_default_limit(sql);
         let tx = self.bg_tx.clone();
 
         thread::spawn(move || {
@@ -4349,12 +4780,29 @@ impl App {
                 "-e".to_string(),
                 sql.clone(),
                 "--batch".to_string(),
-                "--raw".to_string(),
             ];
+            // No `--raw`: the client then escapes SQL NULL as `\N` (and tabs /
+            // newlines inside values), letting us tell NULL from the text "NULL".
             if let Some(db) = database {
                 args.push(db);
             }
-            let output = std::process::Command::new("mysql").args(&args).output();
+            // Spawn (not `output()`) so the query can be cancelled: the pid is
+            // sent back and `Esc` kills it.
+            let spawned = std::process::Command::new("mysql")
+                .args(&args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn();
+            let child = match spawned {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(BgMsg::QueryError(e.to_string()));
+                    return;
+                }
+            };
+            let _ = tx.send(BgMsg::QueryStarted(child.id()));
+            let output = child.wait_with_output();
             let elapsed = start.elapsed().as_millis() as u64;
             match output {
                 Ok(out) if out.status.success() => {
@@ -4437,6 +4885,246 @@ impl App {
                 }
             }
         });
+    }
+
+    /// Focus the multi-line SQL console (showing it if hidden).
+    fn focus_console(&mut self) {
+        if self.rds_connection.is_none() {
+            self.set_error("Not connected. Press c to connect.".to_string());
+            return;
+        }
+        self.console_visible = true;
+        self.active_panel = 3;
+    }
+
+    fn toggle_console(&mut self) {
+        self.console_visible = !self.console_visible;
+        if !self.console_visible && self.active_panel == 3 {
+            self.active_panel = 2;
+        }
+    }
+
+    fn resize_console(&mut self, grow: bool) {
+        if grow {
+            self.split_rds_console = (self.split_rds_console + 5).min(80);
+        } else {
+            self.split_rds_console = self.split_rds_console.saturating_sub(5).max(15);
+        }
+    }
+
+    /// Run the statement under the console cursor (Ctrl+Enter).
+    fn execute_console_statement(&mut self) {
+        if let Some(stmt) = self.sql_editor.statement_at_cursor() {
+            self.run_sql(stmt);
+        }
+    }
+
+    /// Unified SQL execution: SELECT runs directly; modifications go through the
+    /// DML preview / DDL confirmation path (reusing the existing flow).
+    fn run_sql(&mut self, sql: String) {
+        if sql.trim().is_empty() {
+            return;
+        }
+        self.add_to_sql_history(&sql);
+        if is_modification_query(&sql) {
+            if is_dml_query(&sql) {
+                self.spawn_preview_dml(&sql);
+            } else {
+                let truncated = crate::ui::text::truncate_chars(&sql, 80);
+                self.confirm
+                    .show(&format!("Execute modification query?\n\n{truncated}"));
+                self.pending_action = Some(PendingAction::ExecuteDmlQuery { sql });
+            }
+        } else {
+            self.spawn_execute_query(&sql);
+        }
+    }
+
+    fn open_console_file(&mut self, mode: BrowserMode) {
+        let start = self.launch_dir.clone();
+        self.file_browser.open(mode, &start);
+    }
+
+    /// Open (or advance) the console completion popup using schema context.
+    fn open_console_completion(&mut self) {
+        if self.sql_editor.completion_active() {
+            self.sql_editor.completion_next();
+            return;
+        }
+        let (anchor, qualifier, prefix) = self.sql_editor.completion_context();
+        let sql = self.sql_editor.text();
+        let candidates = self.build_sql_candidates(qualifier.as_deref(), &prefix, &sql);
+        self.sql_editor.open_completion(anchor, candidates);
+    }
+
+    /// As-you-type completion: refresh the popup after each edit. Opens right
+    /// after a `.` (columns) and from 2 chars for a plain word; closes when the
+    /// context no longer warrants suggestions.
+    fn refresh_console_completion(&mut self) {
+        let (anchor, qualifier, prefix) = self.sql_editor.completion_context();
+        let qualified = qualifier.is_some();
+        let enough = qualified || prefix.chars().count() >= 2;
+        if !enough {
+            self.sql_editor.cancel_completion();
+            return;
+        }
+        let sql = self.sql_editor.text();
+        let candidates = self.build_sql_candidates(qualifier.as_deref(), &prefix, &sql);
+        if candidates.is_empty() {
+            self.sql_editor.cancel_completion();
+        } else {
+            self.sql_editor.open_completion(anchor, candidates);
+        }
+    }
+
+    /// Build completion candidates from the schema. A `qualifier` (e.g. `o` in
+    /// `o.cust`) yields that table's columns; otherwise tables + in-scope
+    /// columns + SQL keywords.
+    fn build_sql_candidates(
+        &self,
+        qualifier: Option<&str>,
+        prefix: &str,
+        sql: &str,
+    ) -> Vec<String> {
+        let lower = prefix.to_lowercase();
+        let starts = |s: &str| s.to_lowercase().starts_with(&lower);
+        let mut out: Vec<String> = Vec::new();
+
+        if let Some(q) = qualifier {
+            if let Some(table) = self.resolve_qualifier(q, sql) {
+                if let Some(cols) = self.table_columns.get(&table) {
+                    out.extend(cols.iter().filter(|c| starts(c)).cloned());
+                }
+            }
+        } else {
+            out.extend(self.rds_tables.tables.iter().filter(|t| starts(t)).cloned());
+            for table in parse_table_aliases(sql).into_iter().map(|(_, t)| t) {
+                if let Some(cols) = self.table_columns.get(&table) {
+                    out.extend(cols.iter().filter(|c| starts(c)).cloned());
+                }
+            }
+            if !lower.is_empty() {
+                for kw in crate::ui::components::sql_editor::sql_keywords() {
+                    if kw.to_lowercase().starts_with(&lower) {
+                        out.push(kw.to_lowercase());
+                    }
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Resolve a qualifier (table alias or table name) to a real table name.
+    fn resolve_qualifier(&self, qualifier: &str, sql: &str) -> Option<String> {
+        let ql = qualifier.to_lowercase();
+        for (alias, table) in parse_table_aliases(sql) {
+            if alias == ql {
+                return Some(table);
+            }
+        }
+        // Fall back: the qualifier is itself a known table.
+        if self.table_columns.contains_key(qualifier)
+            || self
+                .rds_tables
+                .tables
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(qualifier))
+        {
+            return Some(qualifier.to_string());
+        }
+        None
+    }
+
+    /// Fetch column names for the connected database via INFORMATION_SCHEMA.
+    fn spawn_load_columns(&mut self) {
+        let conn = match &self.rds_connection {
+            Some(c) => c,
+            None => return,
+        };
+        // Needs a default schema for DATABASE() to resolve.
+        if conn.database.is_none() {
+            return;
+        }
+        let host = conn.host.clone();
+        let port = conn.port;
+        let user = conn.user.clone();
+        let password = conn.password.clone();
+        let database = conn.database.clone();
+        let tx = self.bg_tx.clone();
+
+        thread::spawn(move || {
+            let sql = "SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS \
+                       WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME, ORDINAL_POSITION";
+            let mut args = vec![
+                "-h".to_string(),
+                host,
+                "-P".to_string(),
+                port.to_string(),
+                "-u".to_string(),
+                user,
+                format!("--password={password}"),
+                "-e".to_string(),
+                sql.to_string(),
+                "--batch".to_string(),
+                "--skip-column-names".to_string(),
+            ];
+            if let Some(db) = database {
+                args.push(db);
+            }
+            if let Ok(out) = std::process::Command::new("mysql").args(&args).output() {
+                if out.status.success() {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    let pairs: Vec<(String, String)> = text
+                        .lines()
+                        .filter_map(|l| l.split_once('\t'))
+                        .map(|(t, c)| (t.to_string(), c.to_string()))
+                        .collect();
+                    let _ = tx.send(BgMsg::ColumnsLoaded(pairs));
+                }
+            }
+        });
+    }
+
+    fn handle_browser_outcome(&mut self, outcome: BrowserOutcome) {
+        match outcome {
+            BrowserOutcome::None | BrowserOutcome::Cancelled => {}
+            BrowserOutcome::PickFile(path) => {
+                if self.file_browser.mode() == BrowserMode::Save {
+                    self.write_sql_file(&path);
+                } else {
+                    self.load_sql_file(&path);
+                }
+            }
+            BrowserOutcome::PickDir(dir) => {
+                self.pending_save_dir = Some(dir);
+                self.input_mode = InputMode::SaveSqlFilename;
+                self.input.show("Save script as", "query.sql");
+            }
+        }
+    }
+
+    fn load_sql_file(&mut self, path: &std::path::Path) {
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                self.sql_editor.set_text(&content);
+                self.focus_console();
+                self.set_info(format!("Loaded {}", path.display()));
+            }
+            Err(e) => self.set_error(format!("Read error: {e}")),
+        }
+    }
+
+    fn write_sql_file(&mut self, path: &std::path::Path) {
+        use std::io::Write;
+        match std::fs::File::create(path) {
+            Ok(mut f) => match f.write_all(self.sql_editor.text().as_bytes()) {
+                Ok(()) => self.set_info(format!("Saved {}", path.display())),
+                Err(e) => self.set_error(format!("Write error: {e}")),
+            },
+            Err(e) => self.set_error(format!("Cannot create file: {e}")),
+        }
     }
 
     fn show_sql_query_input(&mut self) {
@@ -5128,6 +5816,50 @@ fn format_instance_detail(inst: &aws::Instance) -> Vec<String> {
     lines
 }
 
+/// Heuristic parse of `FROM`/`JOIN` clauses into `(alias_or_table_lower, table)`
+/// pairs, so `o` in `FROM orders o` resolves to `orders`. Both the table name
+/// and its alias map to the table.
+fn parse_table_aliases(sql: &str) -> Vec<(String, String)> {
+    let tokens: Vec<String> = sql
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .map(|s| s.trim_matches(|c| c == '`' || c == '(' || c == ')'))
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+
+    let is_ident = |s: &str| s.chars().all(|c| c.is_alphanumeric() || c == '_') && !s.is_empty();
+    let is_kw = |s: &str| {
+        crate::ui::components::sql_editor::sql_keywords()
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case(s))
+    };
+
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let upper = tokens[i].to_uppercase();
+        if upper == "FROM" || upper == "JOIN" {
+            if let Some(table) = tokens.get(i + 1) {
+                if is_ident(table) && !is_kw(table) {
+                    out.push((table.to_lowercase(), table.clone()));
+                    // Optional alias, possibly preceded by AS.
+                    let mut j = i + 2;
+                    if tokens.get(j).is_some_and(|t| t.eq_ignore_ascii_case("AS")) {
+                        j += 1;
+                    }
+                    if let Some(alias) = tokens.get(j) {
+                        if is_ident(alias) && !is_kw(alias) {
+                            out.push((alias.to_lowercase(), table.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 fn is_modification_query(sql: &str) -> bool {
     let upper = sql.trim_start().to_uppercase();
     upper.starts_with("INSERT")
@@ -5143,6 +5875,18 @@ fn is_modification_query(sql: &str) -> bool {
 fn is_dml_query(sql: &str) -> bool {
     let upper = sql.trim_start().to_uppercase();
     upper.starts_with("INSERT") || upper.starts_with("UPDATE") || upper.starts_with("DELETE")
+}
+
+/// Append a default `LIMIT` to a bare `SELECT` so huge tables don't flood the
+/// grid. Leaves explicit-LIMIT selects and non-SELECT statements untouched.
+fn with_default_limit(sql: &str) -> String {
+    let trimmed = sql.trim().trim_end_matches(';');
+    let lower = trimmed.to_lowercase();
+    if lower.starts_with("select") && !lower.contains(" limit ") {
+        format!("{trimmed} LIMIT 500")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn parse_mysql_batch_output(text: &str) -> (Vec<String>, Vec<Vec<String>>) {
@@ -5251,43 +5995,6 @@ fn parse_datetime(s: &str) -> Option<i64> {
     None
 }
 
-/// Copies text to the system clipboard. Tries wl-copy (Wayland), xclip, xsel in order.
-fn copy_to_clipboard(text: &str) -> Result<(), String> {
-    use std::process::{Command, Stdio};
-
-    let candidates: &[(&str, &[&str])] = &[
-        ("wl-copy", &[]),
-        ("xclip", &["-selection", "clipboard"]),
-        ("xsel", &["--clipboard", "--input"]),
-    ];
-
-    for (cmd, args) in candidates {
-        if which::which(cmd).is_ok() {
-            let mut child = Command::new(cmd)
-                .args(*args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|e| e.to_string())?;
-
-            if let Some(ref mut stdin) = child.stdin {
-                use std::io::Write;
-                stdin
-                    .write_all(text.as_bytes())
-                    .map_err(|e| e.to_string())?;
-            }
-
-            let status = child.wait().map_err(|e| e.to_string())?;
-            if status.success() {
-                return Ok(());
-            }
-        }
-    }
-
-    Err("No clipboard tool found (install wl-copy, xclip, or xsel)".to_string())
-}
-
 fn is_sso_profile(profile: &str) -> bool {
     let home = match std::env::var("HOME") {
         Ok(h) => h,
@@ -5343,4 +6050,37 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+#[cfg(test)]
+mod sql_helpers_tests {
+    use super::*;
+
+    #[test]
+    fn aliases_resolve_table_and_alias() {
+        let pairs = parse_table_aliases("SELECT * FROM orders o WHERE o.id = 1");
+        assert!(pairs.contains(&("orders".to_string(), "orders".to_string())));
+        assert!(pairs.contains(&("o".to_string(), "orders".to_string())));
+    }
+
+    #[test]
+    fn aliases_handle_as_and_joins() {
+        let pairs =
+            parse_table_aliases("SELECT * FROM orders AS o JOIN customers c ON o.cid = c.id");
+        assert!(pairs.contains(&("o".to_string(), "orders".to_string())));
+        assert!(pairs.contains(&("c".to_string(), "customers".to_string())));
+    }
+
+    #[test]
+    fn default_limit_only_for_bare_select() {
+        assert_eq!(
+            with_default_limit("SELECT * FROM t"),
+            "SELECT * FROM t LIMIT 500"
+        );
+        assert_eq!(
+            with_default_limit("SELECT * FROM t LIMIT 5"),
+            "SELECT * FROM t LIMIT 5"
+        );
+        assert_eq!(with_default_limit("SHOW TABLES"), "SHOW TABLES");
+    }
 }

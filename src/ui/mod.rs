@@ -1,4 +1,5 @@
 pub mod app;
+pub mod clipboard;
 pub mod components;
 pub mod fuzzy;
 pub mod keys;
@@ -7,3 +8,4 @@ pub mod messages;
 pub mod panels;
 pub mod style;
 pub mod text;
+pub mod text_buffer;
