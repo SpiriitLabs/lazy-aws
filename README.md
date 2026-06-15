@@ -21,10 +21,16 @@ Built with [ratatui](https://ratatui.rs) + [crossterm](https://github.com/crosst
 - **ECS** — Browse clusters, services, tasks, and containers. Force new deployments, stop tasks, exec into containers
 - **SSM** — List EC2 instances with SSM agent, start interactive sessions
 - **CloudWatch Logs** — Browse log groups and streams, live tail in real-time, run Logs Insights queries with templates
-- **RDS** — Browse RDS/Aurora instances, connect via direct or SSM tunnel, run SQL queries in-TUI, browse tables, export results to CSV, import SQL files
+- **RDS — DataGrip-style database client** — Browse RDS/Aurora instances, connect via direct or SSM tunnel, and work in a split **SQL console + results grid**:
+  - **Multi-line SQL console** with syntax highlighting, `;`-statement execution, autocompletion (tables, columns, keywords), and save/open `.sql` scripts via an in-TUI file browser
+  - **Spreadsheet-style results grid**: cell-by-cell navigation, **mouse cell-range selection**, sort by column, frozen/hidden columns, a full-value viewer for long text/JSON, and a distinct `<null>` rendering
+  - DML/DDL with preview & confirmation, query cancellation, on-demand table structure, and CSV/JSON export
+- **S3** — Browse buckets and objects, download/upload, delete, sort
+- **Mouse support** — Click to focus, scroll (Shift+scroll = horizontal in the grid), drag to select cells, click a header to sort, double-click for the value viewer, drag a panel border to resize
+- **Resizable panels** — Every panel is resizable: `Ctrl+N` enters resize mode then arrows move the dividers, or drag a border with the mouse
 - **Profile management** — Switch AWS profiles on the fly, automatic SSO login for SSO profiles
 - **Search** — Filter any list with `/` (clusters, services, tasks, log groups, query results...)
-- **Copy** — Press `y` to copy ARNs, IDs, table names, or query result rows to clipboard
+- **Copy** — Press `y` to copy ARNs, IDs, table names, or grid cells/selection (TSV) to the clipboard. Uses the native clipboard **plus OSC 52**, so copy works even over **SSH / tmux**
 - **Light/Dark theme** — Auto-detects terminal background, toggle with `Ctrl+L`
 
 ## Prerequisites
@@ -33,6 +39,7 @@ Built with [ratatui](https://ratatui.rs) + [crossterm](https://github.com/crosst
 - [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) installed and configured
 - [session-manager-plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) (optional, required for ECS exec, SSM sessions, and RDS SSM tunnels — lazy-aws can install it for you)
 - `mysql` CLI client (optional, required for the RDS tab — `mysql-client` or `mariadb-client` package)
+- Clipboard: works out of the box (native clipboard + OSC 52, including over SSH/tmux). On bare X11/Wayland without a clipboard manager, `wl-copy`, `xclip`, or `xsel` are used as a fallback
 
 ## Installation
 
@@ -139,20 +146,24 @@ On subsequent connections, saved credentials are used automatically.
 
 | Key | Action |
 |-----|--------|
-| `1` `2` `3` `4` `5` | Switch tab (ECS / Tasks / SSM / Logs / RDS) |
+| `1` `2` `3` `4` `5` `6` | Switch tab (ECS / Tasks / SSM / Logs / RDS / S3) |
 | `Tab` / `Shift+Tab` | Next / previous panel |
 | `j` / `k` or `Up` / `Down` | Navigate up / down |
 | `Enter` | Select / drill-down |
 | `Backspace` | Go back |
 | `/` | Filter current list |
 | `Esc` | Clear filter / cancel |
-| `y` | Copy selected item to clipboard |
+| `y` | Copy selected item to clipboard (native + OSC 52) |
 | `p` | Switch AWS profile |
 | `L` | SSO login |
 | `R` | Refresh all data |
+| `Ctrl+N` | Toggle panel resize mode (then arrows) |
+| `Ctrl+V` | Cycle layout (auto / horizontal / vertical) |
 | `Ctrl+L` | Toggle light/dark theme |
 | `?` | Show help |
 | `q` / `Ctrl+C` | Quit |
+
+> **Mouse**: click to focus a panel/tab, scroll to navigate, drag a panel border to resize.
 
 ### ECS tab
 
@@ -184,19 +195,58 @@ On subsequent connections, saved credentials are used automatically.
 | `g` / `G` | Go to top / bottom |
 | `PgUp` / `PgDn` | Page up / down |
 
-### RDS tab
+### S3 tab
 
 | Key | Action |
 |-----|--------|
-| `c` | Connect to selected instance (direct or SSM tunnel) |
+| `Enter` | Browse into bucket / prefix |
+| `d` | Download object |
+| `u` | Upload file |
+| `x` | Delete object |
+| `s` | Cycle sort |
+
+### RDS tab
+
+Connection & instances/tables panels:
+
+| Key | Action |
+|-----|--------|
+| `c` | Connect to selected instance (direct or SSM tunnel — auto-selects the bastion if only one is available) |
 | `d` | Disconnect |
-| `s` | Run SQL query |
+| `s` | Focus the SQL console |
+| `m` | Toggle the SQL console (show/hide) |
 | `H` | SQL query history |
-| `Enter` | SELECT * from selected table (on Tables panel) |
-| `e` | Export query results to CSV |
+| `e` | Quick modify query (INSERT/UPDATE/DELETE/DDL) with preview |
 | `i` | Import SQL file |
-| `h` / `l` | Scroll query results left / right |
-| `/` | Filter query results |
+| `Enter` | Preview selected table (`SELECT * … LIMIT`) — on the Tables panel |
+| `t` | Show table structure (columns / types / keys) — on the Tables panel |
+| `E` | Export results to file (`.csv` / `.json`) |
+
+SQL console (focus with `s`):
+
+| Key | Action |
+|-----|--------|
+| `F5` / `Alt+Enter` / `Ctrl+R` | Run the statement under the cursor (`Ctrl+Enter` too, where the terminal supports it) |
+| `Tab` | Open / cycle the autocompletion popup (tables, columns, keywords) — also pops up as you type |
+| `↑` / `↓` / `Enter` | Navigate / accept a completion |
+| `Ctrl+S` / `Ctrl+O` | Save / open a `.sql` script (in-TUI file browser, starts in the launch directory) |
+| `Ctrl+↑` / `Ctrl+↓` | Resize the console / grid split |
+| `Esc` | Leave the console |
+
+Results grid:
+
+| Key | Action |
+|-----|--------|
+| `h` `j` `k` `l` / arrows | Move the cell cursor |
+| `Shift`+arrows / `v` | Extend a cell selection (range) |
+| `y` / `Y` | Copy cell-or-selection (TSV) / full row(s) |
+| `Enter` | Open the value viewer for the current cell |
+| `o` | Sort by the current column |
+| `x` / `X` / `f` | Hide / unhide-all / freeze the current column |
+| `g` / `G` | Go to top / bottom |
+| `/` | Filter results |
+
+> **Grid mouse**: drag to select a cell range, click a column header to sort, double-click a cell to open the value viewer, `Shift`+scroll to scroll horizontally.
 
 ### Insights query editor
 
@@ -212,10 +262,15 @@ On subsequent connections, saved credentials are used automatically.
 
 ### Panel resize
 
+Every panel is resizable (in horizontal layout). Enter resize mode, then move the dividers; or drag a border with the mouse.
+
 | Key | Action |
 |-----|--------|
-| `<` / `>` | Resize left/right split |
-| `-` / `+` | Resize top/bottom split |
+| `Ctrl+N` | Enter / leave resize mode |
+| `←` / `→` | Move the left/right divider |
+| `↑` / `↓` | Move the focused column's top/bottom divider |
+| `Esc` | Leave resize mode |
+| drag a panel border (mouse) | Move that divider directly |
 
 ## Insights Query Templates
 
@@ -256,12 +311,16 @@ src/
 ├── credentials.rs  # Saved RDS credentials (load/save, base64 encode/decode)
 ├── logger/         # File logger (~/.local/state/lazy-aws/debug.log)
 └── ui/
-    ├── app.rs      # Event loop, async loading, key routing
-    ├── style/      # Color theme (dark/light) + style functions
-    ├── components/ # TabBar, StatusBar, ConfirmDialog, InputBox, Spinner, Help
-    └── panels/     # Clusters, Services, Tasks, Containers, Instances,
-                    # LogGroups, LogStreams, LogViewer, Detail, Output, Terminal,
-                    # RdsInstances, RdsTables, QueryResults
+    ├── app.rs        # Event loop, async loading, key & mouse routing, panel resize
+    ├── clipboard.rs  # Copy via native clipboard + OSC 52 + wl-copy/xclip/xsel fallback
+    ├── text_buffer.rs# Shared editable text buffer (InputBox + SqlEditor)
+    ├── style/        # Color theme (dark/light) + style functions
+    ├── components/   # TabBar, StatusBar, ConfirmDialog, ChoiceDialog, InputBox,
+    │                 # Spinner, Help, SqlEditor (SQL console), FileBrowser
+    └── panels/       # Clusters, Services, Tasks, Containers, Instances,
+                      # LogGroups, LogStreams, LogViewer, Detail, Output, Terminal,
+                      # RdsInstances, RdsTables, Buckets, Objects, and
+                      # grid/ — the DataGrid (model / selection / viewport / cell / copy)
 ```
 
 All data loading is asynchronous (background threads + `mpsc` channels) so the UI stays responsive. Each AWS call runs in its own thread — if one fails, the others continue.
