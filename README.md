@@ -45,13 +45,13 @@ Built with [ratatui](https://ratatui.rs) + [crossterm](https://github.com/crosst
 
 ### From GitHub releases (recommended)
 
-Pre-built binaries are available on the [releases page](https://github.com/your-user/lazy-aws/releases).
+Pre-built binaries are available on the [releases page](https://github.com/SpiriitLabs/lazy-aws/releases).
 
 Download the archive matching your platform, extract it, and move the binary to a directory in your `PATH`:
 
 ```bash
 # Example for Linux x86_64 — adjust the version and asset name as needed
-curl -L https://github.com/your-user/lazy-aws/releases/latest/download/lazy-aws-linux-x86_64.tar.gz \
+curl -L https://github.com/SpiriitLabs/lazy-aws/releases/latest/download/lazy-aws-linux-x86_64.tar.gz \
   | tar -xz
 mv lazy-aws ~/.local/bin/
 ```
@@ -61,7 +61,7 @@ Available assets: `lazy-aws-linux-x86_64`, `lazy-aws-linux-aarch64`, `lazy-aws-m
 ### From source
 
 ```bash
-git clone https://github.com/your-user/lazy-aws.git
+git clone https://github.com/SpiriitLabs/lazy-aws.git
 cd lazy-aws
 cargo build --release
 ```
